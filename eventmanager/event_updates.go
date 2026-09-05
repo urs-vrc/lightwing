@@ -24,6 +24,7 @@ type UpdateEventRequest struct {
 	Authorization                   string          `header:"Authorization"`
 	Name                            *string         `json:"name,omitempty"`
 	Description                     OptString       `json:"description,omitempty"`
+	Tag                             *string         `json:"tag,omitempty"`
 	ScoringRulesMode                *string         `json:"scoringRulesMode,omitempty"`
 	CustomScoringTables             json.RawMessage `json:"customScoringTables,omitempty"`
 	ClassRestriction                OptString       `json:"classRestriction,omitempty"`
@@ -196,6 +197,20 @@ func UpdateEventCore(ctx context.Context, p *UpdateEventRequest) (*EventDetail, 
 	var sets []setClause
 	if p.Name != nil {
 		sets = append(sets, setClause{"name = ?", truncate(*p.Name, 255)})
+	}
+	if p.Tag != nil && *p.Tag != "" {
+		tag := *p.Tag
+		if tag == "UNOFFICIAL" {
+			tag = "COMMUNITY"
+		}
+		if tag == "OFFICIAL" {
+			if _, err := auth.RequireSiteAdmin(ctx, p.Authorization); err != nil {
+				return nil, err
+			}
+		} else if tag != "COMMUNITY" {
+			return nil, &errs.Error{Code: errs.InvalidArgument, Message: "tag must be OFFICIAL or COMMUNITY"}
+		}
+		sets = append(sets, setClause{"tag = ?", tag})
 	}
 	if p.Description.Set {
 		var v any

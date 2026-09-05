@@ -5,9 +5,11 @@ import {
   updateAdminEvent,
   recomputeEventPoints,
   listRaceResults,
+  deleteAdminEvent,
+  restoreAdminEvent,
 } from '../lib/admin-api'
 import type { eventmanager } from '../lib/client'
-import type { ClassTier, EventStatus } from '../types'
+import type { ClassTier, EventStatus, EventTag } from '../types'
 import {
   isRaceOngoing,
   isRaceConcluded,
@@ -20,7 +22,8 @@ import { useEventMembers } from './useEventMembers'
 import { useEventResults } from './useEventResults'
 import { useEventStatus } from './useEventStatus'
 
-const STATUS_OPTIONS: EventStatus[] = ['DRAFT', 'UNOFFICIAL', 'OFFICIAL', 'CONCLUDED']
+const STATUS_OPTIONS: EventStatus[] = ['DRAFT', 'PENDING', 'ONGOING', 'CONCLUDED', 'PENDING_DELETION']
+const TAG_OPTIONS: EventTag[] = ['OFFICIAL', 'COMMUNITY']
 const CLASS_TIER_OPTIONS = ['G3', 'G2', 'G1']
 
 export type ActiveTab = 'details' | 'members' | 'races' | 'datasets'
@@ -230,6 +233,35 @@ export function useEventDetail(eventId: string) {
     [eventId, resultsHook],
   )
 
+  const handleDeleteEvent = useCallback(
+    async (permanent?: boolean) => {
+      if (!authHeader) return
+      setGlobalError(null)
+      setGlobalSuccess(null)
+      try {
+        await deleteAdminEvent(eventId, authHeader, permanent)
+        setGlobalSuccess(permanent ? 'Permanently deleted event.' : 'Event moved to Pending Deletion queue.')
+        await reloadCurrentEvent()
+      } catch (cause) {
+        setGlobalError(cause instanceof Error ? cause.message : 'Unable to delete event')
+      }
+    },
+    [authHeader, eventId, reloadCurrentEvent],
+  )
+
+  const handleRestoreEvent = useCallback(async () => {
+    if (!authHeader) return
+    setGlobalError(null)
+    setGlobalSuccess(null)
+    try {
+      const updated = await restoreAdminEvent(eventId, authHeader)
+      setSelectedEvent(updated)
+      setGlobalSuccess('Successfully restored event.')
+    } catch (cause) {
+      setGlobalError(cause instanceof Error ? cause.message : 'Unable to restore event')
+    }
+  }, [authHeader, eventId])
+
   const ongoingRaces = useMemo(() => races.filter(isRaceOngoing), [races])
   const concludedRaces = useMemo(() => races.filter(isRaceConcluded), [races])
   const notStartedRaces = useMemo(() => races.filter(isRaceNotStarted), [races])
@@ -237,6 +269,7 @@ export function useEventDetail(eventId: string) {
   return {
     // constants
     STATUS_OPTIONS,
+    TAG_OPTIONS,
     CLASS_TIER_OPTIONS,
     // state
     selectedEvent,
@@ -273,6 +306,8 @@ export function useEventDetail(eventId: string) {
     handleSetSignupsLocked: statusHook.handleSetSignupsLocked,
     handleUpdateEventDetails,
     handleRecomputeEventPoints,
+    handleDeleteEvent,
+    handleRestoreEvent,
     handleAddMember: membersHook.handleAddMember,
     handleRemoveMember: membersHook.handleRemoveMember,
     handleAddRaceMember: membersHook.handleAddRaceMember,

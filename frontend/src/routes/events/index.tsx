@@ -16,7 +16,7 @@ import {
 } from '@pxlkit/ui-kit'
 import type { eventmanager } from '../../lib/client'
 import { PixelSkeletonList } from '../../components/LoadingSkeleton'
-import type { EventStatus } from '../../types'
+import type { EventStatus, EventTag } from '../../types'
 
 const CLASS_TIER_LABELS: Record<string, string> = {
   PRE_OP: 'PRE-OP',
@@ -33,16 +33,28 @@ const SCORING_LABELS: Record<number, string> = {
 
 const STATUS_LABELS: Record<EventStatus, string> = {
   DRAFT: 'Draft',
-  UNOFFICIAL: 'Unofficial',
-  OFFICIAL: 'Official',
+  PENDING: 'Pending',
+  ONGOING: 'Ongoing',
   CONCLUDED: 'Concluded',
+  PENDING_DELETION: 'Pending Deletion',
+}
+
+const TAG_LABELS: Record<EventTag, string> = {
+  OFFICIAL: 'Official',
+  COMMUNITY: 'Community',
 }
 
 const STATUS_TONE: Record<EventStatus, 'neutral' | 'cyan' | 'green' | 'pink'> = {
   DRAFT: 'neutral',
-  UNOFFICIAL: 'cyan',
-  OFFICIAL: 'green',
+  PENDING: 'cyan',
+  ONGOING: 'green',
   CONCLUDED: 'pink',
+  PENDING_DELETION: 'neutral',
+}
+
+const TAG_TONE: Record<EventTag, 'purple' | 'cyan'> = {
+  OFFICIAL: 'purple',
+  COMMUNITY: 'cyan',
 }
 
 export const Route = createFileRoute('/events/')({
@@ -85,8 +97,8 @@ function EventsPage() {
     )
   }
 
-  // Filter events to exclude DRAFT
-  const publicEvents = data?.events.filter((event) => event.status !== 'DRAFT') || []
+  // Filter events to exclude DRAFT and PENDING_DELETION
+  const publicEvents = data?.events.filter((event) => event.status !== 'DRAFT' && event.status !== 'PENDING_DELETION') || []
 
   return (
     <PixelContainer maxWidth="full" padding="md">
@@ -133,9 +145,14 @@ function EventsPage() {
                             </p>
                           )}
                         </PixelStack>
-                        <PixelBadge tone={STATUS_TONE[event.status as EventStatus]}>
-                          {STATUS_LABELS[event.status as EventStatus].toUpperCase()}
-                        </PixelBadge>
+                        <PixelStack direction="row" gap={2}>
+                          <PixelBadge tone={TAG_TONE[(event.tag as EventTag) || 'COMMUNITY']}>
+                            {(TAG_LABELS[(event.tag as EventTag) || 'COMMUNITY']).toUpperCase()}
+                          </PixelBadge>
+                          <PixelBadge tone={STATUS_TONE[event.status as EventStatus] || 'neutral'}>
+                            {(STATUS_LABELS[event.status as EventStatus] || event.status).toUpperCase()}
+                          </PixelBadge>
+                        </PixelStack>
                       </PixelStack>
 
                       <PixelStack direction="row" gap={4} wrap>

@@ -18,7 +18,7 @@ import { EventMembersTab } from '../../../components/EventMembersTab'
 import { EventRacesTab } from '../../../components/EventRacesTab'
 import { DEFAULT_SCORING_TABLES } from '../../../lib/scoringDefaults'
 import { toLocalISOString } from '../../../lib/datetime'
-import type { ClassTier, EventStatus } from '../../../types'
+import type { ClassTier, EventStatus, EventTag } from '../../../types'
 
 export const Route = createFileRoute('/admin/events/$eventId')({
   beforeLoad: async ({ location }) => {
@@ -31,6 +31,7 @@ function AdminEventDetailPage() {
   const { eventId } = Route.useParams()
   const {
     STATUS_OPTIONS,
+    TAG_OPTIONS,
     CLASS_TIER_OPTIONS,
     selectedEvent,
     activeTab,
@@ -62,6 +63,8 @@ function AdminEventDetailPage() {
     handleSetSignupsLocked,
     handleUpdateEventDetails,
     handleRecomputeEventPoints,
+    handleDeleteEvent,
+    handleRestoreEvent,
     handleAddMember,
     handleRemoveMember,
     handleAddRaceMember,
@@ -306,27 +309,27 @@ function AdminEventDetailPage() {
               <div style={{ textAlign: 'left' }}>
                 <strong>Event Status: DRAFT (Setup Mode)</strong>
                 <p style={{ margin: '4px 0 0 0', fontSize: '12px', color: '#7c2d12' }}>
-                  This event is in private preparation. <strong>Next steps:</strong> Register participants under the "Event Members" tab, create race tracks under the "Races & Tracks" tab, and set Lifecycle Status to <strong>UNOFFICIAL</strong> to publish it.
+                  This event is in private preparation. <strong>Next steps:</strong> Register participants, configure race tracks, and set Lifecycle Status to <strong>PENDING</strong> to publish it.
                 </p>
               </div>
             </AlertBanner>
           )}
-          {selectedEvent.status === 'UNOFFICIAL' && (
+          {selectedEvent.status === 'PENDING' && (
             <AlertBanner variant="warning">
               <div style={{ textAlign: 'left' }}>
-                <strong>Event Status: UNOFFICIAL (Live / Staging)</strong>
+                <strong>Event Status: PENDING (Published / Scheduled)</strong>
                 <p style={{ margin: '4px 0 0 0', fontSize: '12px', color: '#7c2d12' }}>
-                  This event is visible to participants. <strong>Next steps:</strong> Start and end configured races from the "Races & Tracks" tab, record standings, and set status to <strong>OFFICIAL</strong> (admins only) or <strong>CONCLUDED</strong> to finalize.
+                  This event is published and open for signups. Set status to <strong>ONGOING</strong> when races begin, or <strong>CONCLUDED</strong> when finished.
                 </p>
               </div>
             </AlertBanner>
           )}
-          {selectedEvent.status === 'OFFICIAL' && (
+          {selectedEvent.status === 'ONGOING' && (
             <AlertBanner variant="success">
               <div style={{ textAlign: 'left' }}>
-                <strong>Event Status: OFFICIAL (Validated)</strong>
+                <strong>Event Status: ONGOING (Live Competition)</strong>
                 <p style={{ margin: '4px 0 0 0', fontSize: '12px', color: '#ffffff' }}>
-                  Results and overall points have been approved by Site Administrators. Real-time scores and standings are finalized.
+                  Races are currently active. Record standings under the "Races & Tracks" tab and set status to <strong>CONCLUDED</strong> when finished.
                 </p>
               </div>
             </AlertBanner>
@@ -336,8 +339,42 @@ function AdminEventDetailPage() {
               <div style={{ textAlign: 'left' }}>
                 <strong>Event Status: CONCLUDED (Locked)</strong>
                 <p style={{ margin: '4px 0 0 0', fontSize: '12px', color: '#7c2d12' }}>
-                  This competition has finished. Historical standings are locked and archived.
+                  This competition has finished. Historical standings are finalized.
                 </p>
+              </div>
+            </AlertBanner>
+          )}
+          {selectedEvent.status === 'PENDING_DELETION' && (
+            <AlertBanner variant="error">
+              <div style={{ textAlign: 'left', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div>
+                  <strong>Event Status: PENDING DELETION (Queued for Removal)</strong>
+                  <p style={{ margin: '4px 0 0 0', fontSize: '12px', color: '#991b1b' }}>
+                    This event is soft-deleted and will be permanently purged in 7 days.
+                  </p>
+                </div>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button
+                    type="button"
+                    onClick={() => void handleRestoreEvent()}
+                    className="slds-button slds-button_brand"
+                    style={{ fontSize: '11px', padding: '2px 10px' }}
+                  >
+                    Restore Event
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (window.confirm('Are you sure you want to permanently delete this event? This cannot be undone.')) {
+                        void handleDeleteEvent(true)
+                      }
+                    }}
+                    className="slds-button slds-button_destructive"
+                    style={{ fontSize: '11px', padding: '2px 10px' }}
+                  >
+                    Delete Permanently
+                  </button>
+                </div>
               </div>
             </AlertBanner>
           )}
@@ -370,6 +407,20 @@ function AdminEventDetailPage() {
                     Recompute Points
                   </button>
                 )}
+                {selectedEvent.status !== 'PENDING_DELETION' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (window.confirm('Move this event to the Pending Deletion queue? It will be deleted in 7 days.')) {
+                        void handleDeleteEvent(false)
+                      }
+                    }}
+                    className="slds-button slds-button_destructive"
+                    style={{ padding: '2px 8px', fontSize: '11px' }}
+                  >
+                    Delete Event
+                  </button>
+                )}
               </div>
               <p className="slds-text-body_small text-slate-500">ID: {selectedEvent.id}</p>
             </div>
@@ -398,6 +449,26 @@ function AdminEventDetailPage() {
                 </button>
               </div>
 
+              {/* Tag Controller */}
+              <div className="slds-form-element" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <label className="slds-form-element__label font-bold text-slate-700" style={{ fontWeight: 'bold', margin: 0 }}>Tag:</label>
+                <div className="slds-form-element__control">
+                  <select
+                    disabled={eventStatusSaving}
+                    value={selectedEvent.tag || 'OFFICIAL'}
+                    onChange={(e) => void handleUpdateEventStatus({ tag: e.target.value as EventTag })}
+                    className="slds-select"
+                    style={{ minWidth: '110px', padding: '4px 24px 4px 8px', border: '1px solid #dddbda', borderRadius: '4px' }}
+                  >
+                    {TAG_OPTIONS.map((tag) => (
+                      <option key={tag} value={tag}>
+                        {tag}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
               {/* Status controller */}
               <div className="slds-form-element" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <label className="slds-form-element__label font-bold text-slate-700" style={{ fontWeight: 'bold', margin: 0 }}>Lifecycle Status:</label>
@@ -405,7 +476,7 @@ function AdminEventDetailPage() {
                   <select
                     disabled={eventStatusSaving}
                     value={selectedEvent.status}
-                    onChange={(e) => void handleUpdateEventStatus(e.target.value as EventStatus)}
+                    onChange={(e) => void handleUpdateEventStatus({ status: e.target.value as EventStatus })}
                     className="slds-select"
                     style={{ minWidth: '130px', padding: '4px 28px 4px 12px', border: '1px solid #dddbda', borderRadius: '4px' }}
                   >

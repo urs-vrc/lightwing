@@ -17,7 +17,7 @@ import {
   useToast,
 } from '@pxlkit/ui-kit'
 import type { eventmanager } from '../../lib/client'
-import type { EventStatus } from '../../types'
+import type { EventStatus, EventTag } from '../../types'
 import { PixelSkeletonDetail } from '../../components/LoadingSkeleton'
 
 const CLASS_TIER_LABELS: Record<string, string> = {
@@ -33,11 +33,30 @@ const SCORING_LABELS: Record<number, string> = {
   2: 'LADDER-ELO',
 }
 
+const STATUS_LABELS: Record<EventStatus, string> = {
+  DRAFT: 'Draft',
+  PENDING: 'Pending',
+  ONGOING: 'Ongoing',
+  CONCLUDED: 'Concluded',
+  PENDING_DELETION: 'Pending Deletion',
+}
+
+const TAG_LABELS: Record<EventTag, string> = {
+  OFFICIAL: 'Official',
+  COMMUNITY: 'Community',
+}
+
 const STATUS_TONE: Record<EventStatus, 'neutral' | 'cyan' | 'green' | 'pink'> = {
   DRAFT: 'neutral',
-  UNOFFICIAL: 'cyan',
-  OFFICIAL: 'green',
+  PENDING: 'cyan',
+  ONGOING: 'green',
   CONCLUDED: 'pink',
+  PENDING_DELETION: 'neutral',
+}
+
+const TAG_TONE: Record<EventTag, 'purple' | 'cyan'> = {
+  OFFICIAL: 'purple',
+  COMMUNITY: 'cyan',
 }
 
 export const Route = createFileRoute('/events/$eventId')({
@@ -156,7 +175,14 @@ function EventDetailPage() {
                 </div>
               )}
             </PixelStack>
-            <PixelBadge tone={STATUS_TONE[event.status as EventStatus]}>{event.status.toUpperCase()}</PixelBadge>
+            <PixelStack direction="row" gap={2}>
+              <PixelBadge tone={TAG_TONE[(event.tag as EventTag) || 'COMMUNITY']}>
+                {(TAG_LABELS[(event.tag as EventTag) || 'COMMUNITY']).toUpperCase()}
+              </PixelBadge>
+              <PixelBadge tone={STATUS_TONE[event.status as EventStatus] || 'neutral'}>
+                {(STATUS_LABELS[event.status as EventStatus] || event.status).toUpperCase()}
+              </PixelBadge>
+            </PixelStack>
           </PixelStack>
 
           {event.description && (
@@ -187,7 +213,7 @@ function EventDetailPage() {
                     variant="solid"
                     tone={isMember ? 'red' : 'green'}
                     className="pxl-btn-flat"
-                    disabled={isConcluded || event.signupsLocked || joinMutation.isPending || leaveMutation.isPending || (!isMember && event.participantLimit !== null && event.members.length >= event.participantLimit)}
+                    disabled={isConcluded || event.status === 'DRAFT' || event.status === 'PENDING_DELETION' || event.signupsLocked || joinMutation.isPending || leaveMutation.isPending || (!isMember && event.participantLimit !== null && event.members.length >= event.participantLimit)}
                     loading={joinMutation.isPending || leaveMutation.isPending}
                     onClick={() => {
                       if (isConcluded) return

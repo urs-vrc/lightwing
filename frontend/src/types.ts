@@ -2,7 +2,9 @@
 
 export type ClassTier = 'PRE_OP' | 'OP' | 'G3' | 'G2' | 'G1'
 
-export type EventStatus = 'DRAFT' | 'UNOFFICIAL' | 'OFFICIAL' | 'CONCLUDED'
+export type EventStatus = 'DRAFT' | 'PENDING' | 'ONGOING' | 'CONCLUDED' | 'PENDING_DELETION'
+
+export type EventTag = 'OFFICIAL' | 'COMMUNITY'
 
 export type EventOwnerType = 'USER' | 'ORGANIZATION'
 
