@@ -1,4 +1,4 @@
-import { API_BASE_URL, writeStoredSessionToken } from './api'
+import { appClient, getStoredSessionToken, writeStoredSessionToken } from './api'
 import { MOCK_MODE } from './mock-mode'
 
 export type SiteRole = 'USER' | 'SITE_ADMIN'
@@ -20,11 +20,6 @@ export interface AuthSession {
   user: AuthUser
 }
 
-interface SocialSignInResponse {
-  url?: string
-  redirect: boolean
-}
-
 const MOCK_SESSION_KEY = 'lightwing:mock:session'
 
 const defaultMockSession: AuthSession = {
@@ -40,10 +35,6 @@ const defaultMockSession: AuthSession = {
     siteRole: 'SITE_ADMIN',
     vrchatUsername: null,
   },
-}
-
-function authUrl(path: string) {
-  return `${API_BASE_URL}/api/auth${path}`
 }
 
 function sanitizeRedirectPath(raw: string | undefined): string {
@@ -80,26 +71,61 @@ export async function getAuthSession(): Promise<AuthSession | null> {
     return readMockSession()
   }
 
-  const response = await fetch(authUrl('/get-session'), {
-    method: 'GET',
-    credentials: 'include',
-  })
+  let extractedToken: string | null = null
 
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
+  if (typeof window !== 'undefined') {
+    // Check URL hash for #access_token=... (standard OAuth fragment)
+    if (window.location.hash && window.location.hash.includes('access_token=')) {
+      const hashStr = window.location.hash.replace(/^#/, '')
+      const params = new URLSearchParams(hashStr)
+      const tokenInHash = params.get('access_token')
+      if (tokenInHash) {
+        extractedToken = tokenInHash
+        writeStoredSessionToken(tokenInHash)
+
+        params.delete('access_token')
+        const remainingHash = params.toString()
+        const newHash = remainingHash ? `#${remainingHash}` : ''
+        const newUrl = `${window.location.pathname}${window.location.search}${newHash}`
+        window.history.replaceState(null, '', newUrl)
+      }
+    }
+
+    // Check URL search query for ?access_token=... fallback
+    if (!extractedToken && window.location.search && window.location.search.includes('access_token=')) {
+      const params = new URLSearchParams(window.location.search)
+      const tokenInSearch = params.get('access_token')
+      if (tokenInSearch) {
+        extractedToken = tokenInSearch
+        writeStoredSessionToken(tokenInSearch)
+
+        params.delete('access_token')
+        const remainingSearch = params.toString()
+        const newSearch = remainingSearch ? `?${remainingSearch}` : ''
+        const newUrl = `${window.location.pathname}${newSearch}${window.location.hash}`
+        window.history.replaceState(null, '', newUrl)
+      }
+    }
+  }
+
+  const token = extractedToken || getStoredSessionToken()
+  if (!token) {
+    return null
+  }
+
+  try {
+    const payload = await appClient.auth.GetSession()
+    if (payload?.session?.token) {
+      writeStoredSessionToken(payload.session.token)
+      return payload as unknown as AuthSession
+    } else {
       writeStoredSessionToken(null)
       return null
     }
-    throw new Error(`Failed to load auth session (${response.status})`)
-  }
-
-  const payload = (await response.json()) as AuthSession | null
-  if (payload?.session?.token) {
-    writeStoredSessionToken(payload.session.token)
-  } else {
+  } catch (err) {
     writeStoredSessionToken(null)
+    return null
   }
-  return payload
 }
 
 export async function signInWithDiscord(redirectPath?: string): Promise<void> {
@@ -111,38 +137,17 @@ export async function signInWithDiscord(redirectPath?: string): Promise<void> {
   }
 
   const callbackPath = sanitizeRedirectPath(redirectPath)
-  // Route the OAuth callback back through /auth so the unified auth page can
-  // verify the session and then return the user to where they were.
   const callbackURL = `${window.location.origin}/auth?redirect=${encodeURIComponent(callbackPath)}`
 
-  const response = await fetch(authUrl('/sign-in/social'), {
-    method: 'POST',
-    credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      provider: 'discord',
-      callbackURL,
-      // Do NOT pre-bake an `error` param here. better-auth redirects back with
-      // its own `?error=<real_code>&error_description=...` on failure (e.g.
-      // `state_mismatch`); pre-baking `?error=oauth` shadowed that real code so
-      // the auth page could never show what actually went wrong. Keep the
-      // `redirect` so a successful return still continues to the right place.
-      errorCallbackURL: `${window.location.origin}/auth?redirect=${encodeURIComponent(callbackPath)}`,
-    }),
+  const payload = await appClient.auth.SignInSocial({
+    CallbackURL: callbackURL,
   })
 
-  if (!response.ok) {
-    throw new Error(`Failed to start Discord sign-in (${response.status})`)
-  }
-
-  const payload = (await response.json()) as SocialSignInResponse
-  if (!payload.url) {
+  if (!payload.redirectUrl) {
     throw new Error('Discord sign-in response did not include a redirect URL')
   }
 
-  window.location.assign(payload.url)
+  window.location.assign(payload.redirectUrl)
 }
 
 export async function signOut(): Promise<void> {
@@ -151,18 +156,12 @@ export async function signOut(): Promise<void> {
     return
   }
 
-  const response = await fetch(authUrl('/sign-out'), {
-    method: 'POST',
-    credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-  })
-
-  writeStoredSessionToken(null)
-
-  if (!response.ok) {
-    throw new Error(`Failed to sign out (${response.status})`)
+  try {
+    await appClient.auth.SignOut()
+  } catch {
+    // Ignore sign-out API network errors, always clear local token
+  } finally {
+    writeStoredSessionToken(null)
   }
 }
 

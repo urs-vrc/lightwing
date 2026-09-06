@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -24,8 +25,8 @@ type SignInSocialResponse struct {
 	RedirectURL string `json:"redirectUrl"`
 }
 
-// GetSessionResponse mirrors the session shape returned by better-auth's
-// get-session and stored by the frontend in localStorage.
+// GetSessionResponse mirrors the session shape returned by get-session and
+// stored by the frontend in localStorage.
 //
 // Frontend stores: lightwing:session:token
 // Sends:   Authorization: Bearer ***
@@ -69,16 +70,38 @@ func discordUserAvatarURL(user *discordAuthUser) string {
 
 // SignInSocial returns a redirect URL to start the Discord OAuth flow.
 //
-// Mirrors ts-legacy/auth/handler.ts GET /auth/sign-in/social (Discord provider)
-//
 //encore:api public method=GET path=/auth/sign-in/social
 func (s *Service) SignInSocial(ctx context.Context, p *SignInSocialParams) (*SignInSocialResponse, error) {
-	state := generateState()
 	redirectTo := p.CallbackURL
 	if redirectTo == "" {
 		redirectTo = "/auth"
 	}
 
+	if debugLoginEnabled() {
+		sessionToken, serr := ensureDebugUserSession(ctx)
+		if serr != nil {
+			rlog.Error("failed to create debug session", "err", serr)
+			return nil, &errs.Error{
+				Code:    errs.Internal,
+				Message: "failed to create debug session",
+			}
+		}
+		targetURL := redirectTo
+		parsed, err := url.Parse(targetURL)
+		if err == nil {
+			if parsed.Fragment != "" {
+				parsed.Fragment += "&access_token=" + sessionToken
+			} else {
+				parsed.Fragment = "access_token=" + sessionToken
+			}
+			targetURL = parsed.String()
+		}
+		return &SignInSocialResponse{
+			RedirectURL: targetURL,
+		}, nil
+	}
+
+	state := generateState()
 	if err := s.storeOAuthState(ctx, state, redirectTo, ""); err != nil {
 		rlog.Error("failed to store OAuth state", "err", err)
 		return nil, &errs.Error{
@@ -100,18 +123,44 @@ func (s *Service) SignInSocial(ctx context.Context, p *SignInSocialParams) (*Sig
 	}, nil
 }
 
+// discordOAuthConfig builds the Discord OAuth2 config for a callback path.
+func (s *Service) discordOAuthConfig(callbackPath string) oauth2.Config {
+	return oauth2.Config{
+		ClientID:     s.secrets.DiscordAuthClientID,
+		ClientSecret: s.secrets.DiscordAuthClientSecret,
+		Endpoint:     discordEndpoint,
+		RedirectURL:  encore.Meta().APIBaseURL.String() + callbackPath,
+		Scopes:       []string{"identify"},
+	}
+}
+
 // oauthCallbackURL returns the full URL of the OAuth callback endpoint.
 func (s *Service) oauthCallbackURL() string {
 	meta := encore.Meta()
 	return meta.APIBaseURL.String() + "/auth/callback/discord"
 }
 
+// fetchDiscordUser fetches user info from Discord using OAuth2 token.
+func fetchDiscordUser(ctx context.Context, conf oauth2.Config, token *oauth2.Token) (*discordAuthUser, error) {
+	resp, err := conf.Client(ctx, token).Get("https://discordapp.com/api/users/@me")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("discord API returned non-200 status: %d", resp.StatusCode)
+	}
+	var discordUser discordAuthUser
+	if err := json.NewDecoder(resp.Body).Decode(&discordUser); err != nil {
+		return nil, err
+	}
+	return &discordUser, nil
+}
+
 // Callback handles the Discord OAuth redirect. It exchanges the code for a token,
 // fetches the user profile from Discord, upserts the user/account/session in the
 // database, then redirects back to the frontend with the session token as a
 // URL fragment (so the SPA can extract it).
-//
-// Mirrors ts-legacy/auth/handler.ts GET /auth/callback/discord
 //
 //encore:api public raw method=GET path=/auth/callback/discord
 func (s *Service) Callback(w http.ResponseWriter, req *http.Request) {
@@ -181,14 +230,18 @@ func (s *Service) Callback(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Redirect back to the frontend with the session token in the URL fragment.
-	// The SPA's auth.tsx extracts the fragment and stores it in localStorage.
+	// The SPA extracts the fragment and stores it in localStorage.
 	frontendURL := frontendBaseURL()
 	parsedURL, err := url.Parse(frontendURL + redirectTo)
 	if err != nil {
 		http.Error(w, "invalid redirect URL", http.StatusInternalServerError)
 		return
 	}
-	parsedURL.Fragment = "access_token=" + sessionToken
+	if parsedURL.Fragment != "" {
+		parsedURL.Fragment += "&access_token=" + sessionToken
+	} else {
+		parsedURL.Fragment = "access_token=" + sessionToken
+	}
 	http.Redirect(w, req, parsedURL.String(), http.StatusFound)
 }
 
@@ -200,15 +253,7 @@ func frontendBaseURL() string {
 	return "http://localhost:3000"
 }
 
-// upsertUserAndSession creates or updates the user, account, and session
-// records for a Discord OAuth user. Returns the session token.
-//
-// Mirrors ts-legacy/auth/auth.ts signIn.callback flow: better-auth links the
-// Discord account (providerId + accountId) to a user, maps the profile with a
-// deterministic placeholder email, assigns a unique slug at creation, and
-// grants SITE_ADMIN to the very first user.
-
-// sessionLifetime matches the TS better-auth session expiry (30 days).
+// sessionLifetime matches session expiry (30 days).
 const sessionLifetime = 30 * 24 * time.Hour
 
 func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token, discordUser *discordAuthUser) (string, error) {
@@ -216,15 +261,10 @@ func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token
 	expiresAt := now.Add(sessionLifetime)
 	sessionToken := generateSessionToken()
 
-	// better-auth scope is identify-only, so Discord never returns an email.
-	// TS mapProfileToUser synthesizes a deterministic non-routable placeholder
-	// (better-auth requires non-null email).
 	email := discordUser.ID + "@discord.invalid"
 	displayName := discordUser.Username
 	avatarURL := discordUserAvatarURL(discordUser)
 
-	// Returning users keep their existing id via the account link, so rows
-	// created by better-auth (cuid ids) stay stable across the migration.
 	userID := ""
 	err := db.QueryRow(ctx,
 		`SELECT "userId" FROM "account" WHERE "providerId" = 'discord' AND "accountId" = $1`,
@@ -234,22 +274,18 @@ func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token
 		return "", fmt.Errorf("failed to look up discord account: %w", err)
 	}
 
-	// Use a transaction to keep user/account/session consistent
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Check if user exists
 	var existingUserID string
 	err = tx.QueryRow(ctx,
 		`SELECT id FROM "user" WHERE id = $1`, userID,
 	).Scan(&existingUserID)
 
 	if errors.Is(err, sql.ErrNoRows) || userID == "" {
-		// Insert new user with a generated slug, mirroring the TS
-		// user-create database hook. The first user bootstraps SITE_ADMIN.
 		var userCount int
 		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM "user"`).Scan(&userCount); err != nil {
 			return "", fmt.Errorf("failed to count users: %w", err)
@@ -277,7 +313,6 @@ func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token
 	} else if err != nil {
 		return "", fmt.Errorf("failed to check existing user: %w", err)
 	} else {
-		// Update existing user
 		_, err = tx.Exec(ctx,
 			`UPDATE "user" SET name = $1, email = $2, image = $3, "updatedAt" = $4
 			 WHERE id = $5`,
@@ -288,8 +323,6 @@ func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token
 		}
 	}
 
-	// Upsert the Discord account link using the real account columns.
-	// (No unique constraint covers (userId, providerId), so select-then-write.)
 	scope, _ := token.Extra("scope").(string)
 	accessExpires := sql.NullTime{}
 	if !token.Expiry.IsZero() {
@@ -326,7 +359,6 @@ func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token
 		}
 	}
 
-	// Get active organization (first member org)
 	var activeOrgID string
 	err = tx.QueryRow(ctx,
 		`SELECT "organizationId" FROM "member" WHERE "userId" = $1 ORDER BY "createdAt" ASC LIMIT 1`,
@@ -336,7 +368,6 @@ func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token
 		return "", fmt.Errorf("failed to fetch active org: %w", err)
 	}
 
-	// Delete any existing sessions for this user (single active session)
 	_, err = tx.Exec(ctx,
 		`DELETE FROM "session" WHERE "userId" = $1`,
 		userID,
@@ -345,7 +376,6 @@ func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token
 		return "", fmt.Errorf("failed to delete old sessions: %w", err)
 	}
 
-	// Insert new session
 	_, err = tx.Exec(ctx,
 		`INSERT INTO "session" (id, "userId", token, "activeOrganizationId", "expiresAt", "createdAt", "updatedAt")
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -361,7 +391,6 @@ func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token
 		return "", fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	// Sync Discord staff role → siteRole
 	go func() {
 		backgroundCtx := context.Background()
 		err := svc.syncSiteRoleFromDiscordMembership(backgroundCtx, userID)
@@ -377,24 +406,20 @@ func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token
 
 // GetSession returns the session and user profile for the authenticated caller.
 //
-// Mirrors ts-legacy/auth/auth.ts get-session endpoint
-//
 //encore:api public
 func (s *Service) GetSession(ctx context.Context) (*GetSessionResponse, error) {
 	token := getAuthorizationToken(ctx)
-	hasCookie := token != ""
 
 	if token == "" {
 		getSessionOutcome.With(getSessionOutcomeLabels{}).Add(1)
 		return nil, &errs.Error{Code: errs.Unauthenticated, Message: "not authenticated"}
 	}
-	return getSessionData(ctx, token, hasCookie)
+	return getSessionData(ctx, token, false)
 }
 
 // getSessionData resolves a session token to the session + profile response.
 // Split from the endpoint so tests can call it with an explicit token.
 func getSessionData(ctx context.Context, token string, hasCookie bool) (*GetSessionResponse, error) {
-	// Resolve the session from the token
 	actor, err := resolveActor(ctx, "Bearer "+token)
 	if err != nil {
 		rlog.Error("resolveActor failed in GetSession", "err", err)
@@ -403,13 +428,11 @@ func getSessionData(ctx context.Context, token string, hasCookie bool) (*GetSess
 	}
 	getSessionOutcome.With(getSessionOutcomeLabels{HasCookie: hasCookie, HasSession: true}).Add(1)
 
-	// Fetch full user profile
 	profile, err := getUserProfile(ctx, actor.UserID)
 	if err != nil {
 		return nil, &errs.Error{Code: errs.Internal, Message: "failed to load user profile"}
 	}
 
-	// Fetch session expiry
 	var expiresAt time.Time
 	err = db.QueryRow(ctx,
 		`SELECT "expiresAt" FROM "session" WHERE "token" = $1`, token,
@@ -418,7 +441,6 @@ func getSessionData(ctx context.Context, token string, hasCookie bool) (*GetSess
 		return nil, &errs.Error{Code: errs.Internal, Message: "failed to load session"}
 	}
 
-	// Ensure the user has a slug (lazy assignment for pre-slug rows)
 	if profile.Slug == nil {
 		if slug, err := ensureUserSlug(ctx, db, actor.UserID); err != nil {
 			rlog.Error("failed to ensure user slug", "err", err)
@@ -438,22 +460,27 @@ func getSessionData(ctx context.Context, token string, hasCookie bool) (*GetSess
 
 // SignOut deletes the caller's session.
 //
-// Mirrors ts-legacy/auth/auth.ts sign-out
-//
 //encore:api public
 func (s *Service) SignOut(ctx context.Context) error {
 	token := getAuthorizationToken(ctx)
 	if token == "" {
-		// Idempotent: calling sign-out with no session is a no-op, not an error.
 		return nil
 	}
 
-	// Delete the session and drop its cached actor (idempotent no-op if gone)
 	if err := signOutSession(ctx, token); err != nil {
 		return fmt.Errorf("failed to delete session: %w", err)
 	}
 
 	return nil
+}
+
+// signOutSession deletes a session row and drops its cached actor.
+func signOutSession(ctx context.Context, token string) error {
+	if actorCache != nil {
+		_, _ = actorCache.Delete(ctx, actorCacheKey{Token: token})
+	}
+	_, err := db.Exec(ctx, `DELETE FROM "session" WHERE "token" = $1`, token)
+	return err
 }
 
 // --- Token Extraction ---

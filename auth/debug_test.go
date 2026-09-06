@@ -1,112 +1,78 @@
 package auth
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
-
 )
 
-// Debug bypass end-to-end through the browser sign-in endpoint: provision the
-// debug admin, set the normal session cookie, return the callbackURL.
+func testAuthService() *Service {
+	return &Service{secrets: &serviceSecrets{
+		SessionCookieSecret:     "test-cookie-secret-at-least-32-bytes!",
+		DiscordAuthClientID:     "test-client-id",
+		DiscordAuthClientSecret: "test-client-secret",
+	}}
+}
+
+// Debug bypass end-to-end through the SignInSocial endpoint: provisions the
+// debug admin and returns redirectUrl with access_token fragment.
 func Test_DebugSignInBypass(t *testing.T) {
 	t.Setenv("LIGHTWING_DEBUG_LOGIN", "1")
-	svc := testCompatService()
+	ctx := context.Background()
+	svc := testAuthService()
 
-	body, _ := json.Marshal(map[string]string{
-		"provider":    "discord",
-		"callbackURL": "http://localhost:5173/auth?redirect=/events",
+	resp, err := svc.SignInSocial(ctx, &SignInSocialParams{
+		CallbackURL: "http://localhost:5173/auth?redirect=/events",
 	})
-	req := httptest.NewRequest(http.MethodPost, "/api/auth/sign-in/social", bytes.NewReader(body))
-	rec := httptest.NewRecorder()
-	svc.CompatSignInSocial(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var payload struct {
-		URL      string `json:"url"`
-		Redirect bool   `json:"redirect"`
-	}
-	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if payload.URL != "http://localhost:5173/auth?redirect=/events" {
-		t.Errorf("url = %q, want the callbackURL", payload.URL)
-	}
-	cookies := rec.Result().Cookies()
-	if len(cookies) == 0 {
-		t.Fatal("no session cookie set")
+	if err != nil {
+		t.Fatalf("SignInSocial failed: %v", err)
 	}
 
-	// The cookie authenticates get-session like a real Discord login.
-	var sessionCookie *http.Cookie
-	for _, c := range cookies {
-		if c.Name == sessionCookieName {
-			sessionCookie = c
-		}
+	u, err := url.Parse(resp.RedirectURL)
+	if err != nil {
+		t.Fatalf("parse redirect url: %v", err)
 	}
-	if sessionCookie == nil {
-		t.Fatalf("no %q cookie among %v", sessionCookieName, cookies)
+
+	if !strings.HasPrefix(u.String(), "http://localhost:5173/auth?redirect=/events#access_token=") {
+		t.Errorf("redirectUrl = %q, want fragment with access_token", resp.RedirectURL)
 	}
-	getReq := httptest.NewRequest(http.MethodGet, "/api/auth/get-session", nil)
-	getReq.AddCookie(sessionCookie)
-	getRec := httptest.NewRecorder()
-	svc.CompatGetSession(getRec, getReq)
-	if getRec.Code != http.StatusOK {
-		t.Fatalf("get-session status = %d, want 200", getRec.Code)
+
+	token := strings.TrimPrefix(u.Fragment, "access_token=")
+	if token == "" {
+		t.Fatalf("access_token in fragment is empty")
 	}
-	var session struct {
-		User struct {
-			ID       string `json:"id"`
-			SiteRole string `json:"siteRole"`
-		} `json:"user"`
+
+	// The token authenticates GetSession like a real Discord login.
+	sessionResp, err := getSessionData(ctx, token, false)
+	if err != nil {
+		t.Fatalf("getSessionData status failed: %v", err)
 	}
-	if err := json.NewDecoder(getRec.Body).Decode(&session); err != nil {
-		t.Fatalf("decode session: %v", err)
+
+	if sessionResp.User.ID != debugUserID {
+		t.Errorf("user id = %q, want %q", sessionResp.User.ID, debugUserID)
 	}
-	if session.User.ID != debugUserID {
-		t.Errorf("user id = %q, want %q", session.User.ID, debugUserID)
-	}
-	if session.User.SiteRole != string(SiteRoleSiteAdmin) {
-		t.Errorf("siteRole = %q, want SITE_ADMIN", session.User.SiteRole)
+	if sessionResp.User.SiteRole != string(SiteRoleSiteAdmin) {
+		t.Errorf("siteRole = %q, want SITE_ADMIN", sessionResp.User.SiteRole)
 	}
 }
 
 // Without the env var the endpoint keeps the Discord flow: it stores state
-// and returns a Discord authorize URL, setting no session cookie.
+// and returns a Discord authorize URL.
 func Test_DebugBypassDisabledKeepsDiscordFlow(t *testing.T) {
 	t.Setenv("LIGHTWING_DEBUG_LOGIN", "")
-	svc := testCompatService()
+	ctx := context.Background()
+	svc := testAuthService()
 
-	body, _ := json.Marshal(map[string]string{
-		"provider":    "discord",
-		"callbackURL": "http://localhost:5173/auth",
+	resp, err := svc.SignInSocial(ctx, &SignInSocialParams{
+		CallbackURL: "http://localhost:5173/auth",
 	})
-	req := httptest.NewRequest(http.MethodPost, "/api/auth/sign-in/social", bytes.NewReader(body))
-	rec := httptest.NewRecorder()
-	svc.CompatSignInSocial(rec, req)
+	if err != nil {
+		t.Fatalf("SignInSocial failed: %v", err)
+	}
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var payload struct {
-		URL string `json:"url"`
-	}
-	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if !strings.Contains(payload.URL, "discord.com") {
-		t.Errorf("url = %q, want a Discord authorize URL", payload.URL)
-	}
-	for _, c := range rec.Result().Cookies() {
-		if c.Name == sessionCookieName {
-			t.Errorf("session cookie must not be set when bypass is disabled")
-		}
+	if !strings.Contains(resp.RedirectURL, "discord.com") {
+		t.Errorf("url = %q, want a Discord authorize URL", resp.RedirectURL)
 	}
 }
 
@@ -133,9 +99,6 @@ func Test_EnsureDebugUserSession(t *testing.T) {
 	if token2 == token {
 		t.Error("expected a fresh token on re-login")
 	}
-	// Old session row is gone (single active session). Note resolveActor may
-	// still serve the old token from the actor cache until its TTL lapses —
-	// same staleness as the Discord rotation path.
 	var remaining int
 	if err := db.QueryRow(ctx,
 		`SELECT COUNT(*) FROM "session" WHERE "userId" = $1`, debugUserID,
