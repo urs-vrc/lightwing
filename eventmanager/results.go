@@ -503,8 +503,33 @@ func ApplyAutoDeferralsForEvent(ctx context.Context, eventID string, modifiedRac
 	isTerminal := func(status sql.NullString) bool {
 		return status.Valid && (status.String == "DSQ" || status.String == "DNF" || status.String == "DNS")
 	}
+	raceGrades := map[string]string{}
+	raceSeqs := map[string]int{}
+	grows, err := db.Query(ctx, `SELECT id, grade, sequence FROM "race_event" WHERE "eventId"=$1`, eventID)
+	if err != nil {
+		return err
+	}
+	for grows.Next() {
+		var rid string
+		var g sql.NullString
+		var seq int
+		if err := grows.Scan(&rid, &g, &seq); err != nil {
+			grows.Close()
+			return err
+		}
+		if g.Valid {
+			raceGrades[rid] = g.String
+		}
+		raceSeqs[rid] = seq
+	}
+	grows.Close()
+	if err := grows.Err(); err != nil {
+		return err
+	}
+
 	// Qualification: 1st place in an auto-defer grade, ungraded, no terminal status.
-	winners := map[string]bool{}
+	// Find earliest (lowest race sequence) win for each user.
+	earliestWinSeq := map[string]int{}
 	for _, res := range results {
 		if !res.position.Valid || res.position.Int64 != 1 || isTerminal(res.resultStatus) {
 			continue
@@ -513,7 +538,10 @@ func ApplyAutoDeferralsForEvent(ctx context.Context, eventID string, modifiedRac
 			continue
 		}
 		if isUngraded(res.classTier) {
-			winners[res.userID] = true
+			seq := raceSeqs[res.raceID]
+			if minSeq, ok := earliestWinSeq[res.userID]; !ok || seq < minSeq {
+				earliestWinSeq[res.userID] = seq
+			}
 		}
 	}
 	// All registered users per race: event members (non-granular) + result
@@ -588,35 +616,14 @@ func ApplyAutoDeferralsForEvent(ctx context.Context, eventID string, modifiedRac
 		}
 		lookup[ri.raceID][ri.userID] = ri
 	}
-	raceGrades := map[string]string{}
-	grows, err := db.Query(ctx, `SELECT id, grade FROM "race_event" WHERE "eventId"=$1`, eventID)
-	if err != nil {
-		return err
-	}
-	for grows.Next() {
-		var rid string
-		var g sql.NullString
-		if err := grows.Scan(&rid, &g); err != nil {
-			grows.Close()
-			return err
-		}
-		if g.Valid {
-			raceGrades[rid] = g.String
-		}
-	}
-	grows.Close()
-	if err := grows.Err(); err != nil {
-		return err
-	}
 	for raceID, users := range raceUsers {
+		seq := raceSeqs[raceID]
 		for userID := range users {
 			existing := lookup[raceID][userID]
-			if winners[userID] {
-				autoDeferThis := IsAutoDeferGrade(mode, custom, raceGrades[raceID])
-				wonThis := autoDeferThis && existing != nil && existing.position.Valid && existing.position.Int64 == 1
-				if wonThis {
-					continue
-				}
+			winSeq, hasWin := earliestWinSeq[userID]
+			shouldDefer := hasWin && seq > winSeq
+
+			if shouldDefer {
 				if existing == nil {
 					if _, err := db.Exec(ctx,
 						`INSERT INTO "race_result" (id, "raceEventId", "userId", points, "resultStatus", "createdAt", "updatedAt")

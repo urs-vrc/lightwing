@@ -235,49 +235,128 @@ func Test_AutoDeferralCustomTables(t *testing.T) {
 	f.addEventMemberDirect(eventID, u1)
 
 	race1, err := CreateRaceEventCore(ctx, &CreateRaceEventRequest{
-		EventID: eventID, Authorization: authHeader, Name: "Race 1 OP",
+		EventID: eventID, Authorization: authHeader, Name: "Race 1 GIII",
+		DistanceMeters: 1200, TrackType: "Turf", Location: "Kyoto", Grade: strptr("GIII"),
+	})
+	if err != nil {
+		t.Fatalf("create race1: %v", err)
+	}
+	race2, err := CreateRaceEventCore(ctx, &CreateRaceEventRequest{
+		EventID: eventID, Authorization: authHeader, Name: "Race 2 OP",
+		DistanceMeters: 1600, TrackType: "Dirt", Location: "Tokyo", Grade: strptr("OP"),
+	})
+	if err != nil {
+		t.Fatalf("create race2: %v", err)
+	}
+
+	// OP win on Race 2 must NOT defer (custom OP autoDefer=false).
+	if _, err := AssignRaceResultCore(ctx, &AssignRaceResultRequest{
+		EventID: eventID, RaceID: race2.ID, UserID: u1, Authorization: authHeader,
+		Position: intptr(1),
+	}); err != nil {
+		t.Fatalf("assign OP win: %v", err)
+	}
+	r1, err := ListRaceResultsCore(ctx, &RaceResultsQuery{EventID: eventID, RaceID: race1.ID})
+	if err != nil {
+		t.Fatalf("list race1: %v", err)
+	}
+	if findResult(r1.Results, u1) != nil {
+		t.Error("OP win should not create a race1 row under custom tables")
+	}
+
+	// GIII win on Race 1 MUST defer race2 (custom GIII autoDefer=true, seq 1 < seq 2).
+	if _, err := AssignRaceResultCore(ctx, &AssignRaceResultRequest{
+		EventID: eventID, RaceID: race1.ID, UserID: u1, Authorization: authHeader,
+		Position: intptr(1),
+	}); err != nil {
+		t.Fatalf("assign GIII win: %v", err)
+	}
+	r2, err := ListRaceResultsCore(ctx, &RaceResultsQuery{EventID: eventID, RaceID: race2.ID})
+	if err != nil {
+		t.Fatalf("list race2: %v", err)
+	}
+	u1r2 := findResult(r2.Results, u1)
+	if u1r2 == nil || u1r2.ResultStatus == nil || *u1r2.ResultStatus != "DEFERRED" {
+		t.Errorf("race2 status = %v, want DEFERRED", u1r2)
+	}
+}
+
+func Test_AutoDeferralRespectsSequenceOrdering(t *testing.T) {
+	f := newFixtures(t)
+	ctx := context.Background()
+
+	admin := f.createUser("seqadmin", "Seq Admin", nil, "SITE_ADMIN")
+	authHeader := f.createSession(admin)
+	u1 := f.createUser("sequngraded", "Ungraded Competitor", nil, "USER")
+
+	eventID := f.createEventDirect(admin, "Sequence Auto Defer Event", "UNOFFICIAL", nil, false)
+	f.addEventMemberDirect(eventID, u1)
+
+	race1, err := CreateRaceEventCore(ctx, &CreateRaceEventRequest{
+		EventID: eventID, Authorization: authHeader, Name: "Race 1 OP", Sequence: intptr(1),
 		DistanceMeters: 1200, TrackType: "Turf", Location: "Kyoto", Grade: strptr("OP"),
 	})
 	if err != nil {
 		t.Fatalf("create race1: %v", err)
 	}
 	race2, err := CreateRaceEventCore(ctx, &CreateRaceEventRequest{
-		EventID: eventID, Authorization: authHeader, Name: "Race 2 GIII",
-		DistanceMeters: 1600, TrackType: "Dirt", Location: "Tokyo", Grade: strptr("GIII"),
+		EventID: eventID, Authorization: authHeader, Name: "Race 2 OP", Sequence: intptr(2),
+		DistanceMeters: 1400, TrackType: "Turf", Location: "Hanshin", Grade: strptr("OP"),
 	})
 	if err != nil {
 		t.Fatalf("create race2: %v", err)
 	}
+	race3, err := CreateRaceEventCore(ctx, &CreateRaceEventRequest{
+		EventID: eventID, Authorization: authHeader, Name: "Race 3 GIII", Sequence: intptr(3),
+		DistanceMeters: 1600, TrackType: "Dirt", Location: "Tokyo", Grade: strptr("GIII"),
+	})
+	if err != nil {
+		t.Fatalf("create race3: %v", err)
+	}
 
-	// OP win must NOT defer (custom OP autoDefer=false).
+	// User finished 2nd in Race 1
 	if _, err := AssignRaceResultCore(ctx, &AssignRaceResultRequest{
 		EventID: eventID, RaceID: race1.ID, UserID: u1, Authorization: authHeader,
-		Position: intptr(1),
+		Position: intptr(2),
 	}); err != nil {
-		t.Fatalf("assign OP win: %v", err)
-	}
-	r2, err := ListRaceResultsCore(ctx, &RaceResultsQuery{EventID: eventID, RaceID: race2.ID})
-	if err != nil {
-		t.Fatalf("list race2: %v", err)
-	}
-	if findResult(r2.Results, u1) != nil {
-		t.Error("OP win should not create a race2 row under custom tables")
+		t.Fatalf("assign race1 pos 2: %v", err)
 	}
 
-	// GIII win MUST defer race1 (custom GIII autoDefer=true).
+	// User wins Race 2 (OP grade win)
 	if _, err := AssignRaceResultCore(ctx, &AssignRaceResultRequest{
 		EventID: eventID, RaceID: race2.ID, UserID: u1, Authorization: authHeader,
 		Position: intptr(1),
 	}); err != nil {
-		t.Fatalf("assign GIII win: %v", err)
+		t.Fatalf("assign race2 win: %v", err)
 	}
+
+	// Race 1 (sequence 1) result must remain intact (Position 2, points 10) and NOT be converted to DEFERRED!
 	r1, err := ListRaceResultsCore(ctx, &RaceResultsQuery{EventID: eventID, RaceID: race1.ID})
 	if err != nil {
 		t.Fatalf("list race1: %v", err)
 	}
 	u1r1 := findResult(r1.Results, u1)
-	if u1r1 == nil || u1r1.ResultStatus == nil || *u1r1.ResultStatus != "DEFERRED" {
-		t.Errorf("race1 status = %v, want DEFERRED", u1r1)
+	if u1r1 == nil {
+		t.Fatalf("expected result in race1")
+	}
+	if u1r1.ResultStatus != nil && *u1r1.ResultStatus == "DEFERRED" {
+		t.Errorf("race1 (earlier sequence) status = DEFERRED, expected prior result intact")
+	}
+	if u1r1.Position == nil || *u1r1.Position != 2 {
+		t.Errorf("race1 position = %v, want 2", u1r1.Position)
+	}
+	if u1r1.Points != 10 {
+		t.Errorf("race1 points = %d, want 10", u1r1.Points)
+	}
+
+	// Race 3 (sequence 3, strictly after Race 2 win) MUST be auto-deferred!
+	r3, err := ListRaceResultsCore(ctx, &RaceResultsQuery{EventID: eventID, RaceID: race3.ID})
+	if err != nil {
+		t.Fatalf("list race3: %v", err)
+	}
+	u1r3 := findResult(r3.Results, u1)
+	if u1r3 == nil || u1r3.ResultStatus == nil || *u1r3.ResultStatus != "DEFERRED" {
+		t.Errorf("race3 status = %v, want DEFERRED", u1r3)
 	}
 }
 
