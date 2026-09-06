@@ -39,6 +39,16 @@ export function writeStoredSessionToken(token: string | null) {
   }
 }
 
-// Note: the Go-generated client has no `auth` ClientOptions hook, so every
-// authenticated wrapper passes `Authorization` explicitly in its params.
-export const appClient = new Client(API_BASE_URL)
+export const appClient = new Client(API_BASE_URL, {
+  fetcher: async (input, init) => {
+    const token = getStoredSessionToken()
+    if (token) {
+      const headers = new Headers(init?.headers)
+      if (!headers.has('Authorization') && !headers.has('authorization')) {
+        headers.set('Authorization', `Bearer ${token}`)
+      }
+      return fetch(input, { ...init, headers })
+    }
+    return fetch(input, init)
+  },
+})
