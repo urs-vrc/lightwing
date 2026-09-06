@@ -200,6 +200,10 @@ func (s *Service) Callback(w http.ResponseWriter, req *http.Request) {
 	if redirectTo == "" {
 		redirectTo = "/auth"
 	}
+	// The frontend sends CallbackURL as a full URL; reduce to path-only
+	// before prepending the configured frontend origin (also covers
+	// in-flight state rows stored before this normalization existed).
+	redirectTo = normalizeRedirectTarget(redirectTo)
 
 	conf := s.discordOAuthConfig("/api/auth/callback/discord")
 
@@ -231,7 +235,7 @@ func (s *Service) Callback(w http.ResponseWriter, req *http.Request) {
 
 	// Redirect back to the frontend with the session token in the URL fragment.
 	// The SPA extracts the fragment and stores it in localStorage.
-	frontendURL := frontendBaseURL()
+	frontendURL := strings.TrimSuffix(frontendBaseURL(), "/")
 	parsedURL, err := url.Parse(frontendURL + redirectTo)
 	if err != nil {
 		http.Error(w, "invalid redirect URL", http.StatusInternalServerError)
@@ -243,6 +247,37 @@ func (s *Service) Callback(w http.ResponseWriter, req *http.Request) {
 		parsedURL.Fragment = "access_token=" + sessionToken
 	}
 	http.Redirect(w, req, parsedURL.String(), http.StatusFound)
+}
+
+// normalizeRedirectTarget reduces a redirect target to a safe same-origin
+// path. The frontend sends CallbackURL as a full URL
+// (<origin>/auth?redirect=...), but Callback prepends the configured
+// frontend origin — so an absolute URL must be reduced to path+query here,
+// otherwise the concatenated origin twice fails url.Parse with
+// "invalid redirect URL". Anything not a same-origin path (including
+// protocol-relative "//host/..." targets) falls back to "/auth".
+func normalizeRedirectTarget(target string) string {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "/auth"
+	}
+	if u, err := url.Parse(target); err == nil && u.IsAbs() {
+		path := u.EscapedPath()
+		if path == "" {
+			path = "/"
+		}
+		if u.RawQuery != "" {
+			path += "?" + u.RawQuery
+		}
+		return path
+	}
+	if !strings.HasPrefix(target, "/") || strings.HasPrefix(target, "//") {
+		return "/auth"
+	}
+	if u, err := url.Parse(target); err != nil || u.IsAbs() {
+		return "/auth"
+	}
+	return target
 }
 
 // frontendBaseURL returns the configured frontend origin.

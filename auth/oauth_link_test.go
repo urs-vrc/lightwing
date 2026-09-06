@@ -62,3 +62,33 @@ func Test_SignInSocialDiscordLinkShape(t *testing.T) {
 		t.Errorf("stored state value = %q, want it to contain %q", stored, frontendCallback)
 	}
 }
+
+func Test_NormalizeRedirectTarget(t *testing.T) {
+	cases := map[string]string{
+		// Full frontend CallbackURL must reduce to path+query so Callback
+		// can prepend the configured frontend origin without producing an
+		// unparseable double-origin URL ("invalid redirect URL").
+		"https://lightwing-canary.urs.deno.net/auth?redirect=%2F": "/auth?redirect=%2F",
+		"http://localhost:5173/auth?redirect=%2Fevents":              "/auth?redirect=%2Fevents",
+		"https://example.com/":                                       "/",
+		"/auth?redirect=%2F":                                         "/auth?redirect=%2F",
+		"/":                                                          "/",
+		"":                                                           "/auth",
+		"not-a-path":                                                 "/auth",
+		"//evil.example.com/phish":                                   "/auth",
+	}
+	for in, want := range cases {
+		if got := normalizeRedirectTarget(in); got != want {
+			t.Errorf("normalizeRedirectTarget(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	// The normalized target must always concatenate cleanly with the
+	// configured frontend origin.
+	frontend := strings.TrimSuffix("http://localhost:3000", "/")
+	for in := range cases {
+		if _, err := url.Parse(frontend + normalizeRedirectTarget(in)); err != nil {
+			t.Errorf("frontend+normalizeRedirectTarget(%q) does not parse: %v", in, err)
+		}
+	}
+}
