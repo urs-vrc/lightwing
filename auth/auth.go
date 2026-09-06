@@ -110,13 +110,12 @@ func (s *Service) SignInSocial(ctx context.Context, p *SignInSocialParams) (*Sig
 		}
 	}
 
-	conf := s.discordOAuthConfig("/auth/callback/discord")
+	conf := s.discordOAuthConfig("/api/auth/callback/discord")
 
-	// Encode the redirect path into the state so the callback knows where to
-	// send the user back. State format: <state_value>:<redirect_path>
-	encState := state + ":" + redirectTo
-
-	redirectURL := conf.AuthCodeURL(encState, oauth2.SetAuthURLParam("prompt", "consent"))
+	// The redirect target is stored server-side keyed by state (see
+	// storeOAuthState); the wire state stays a pure random value so Discord
+	// echoes it back verbatim.
+	redirectURL := conf.AuthCodeURL(state, oauth2.SetAuthURLParam("prompt", "consent"))
 
 	return &SignInSocialResponse{
 		RedirectURL: redirectURL,
@@ -137,7 +136,7 @@ func (s *Service) discordOAuthConfig(callbackPath string) oauth2.Config {
 // oauthCallbackURL returns the full URL of the OAuth callback endpoint.
 func (s *Service) oauthCallbackURL() string {
 	meta := encore.Meta()
-	return meta.APIBaseURL.String() + "/auth/callback/discord"
+	return meta.APIBaseURL.String() + "/api/auth/callback/discord"
 }
 
 // fetchDiscordUser fetches user info from Discord using OAuth2 token.
@@ -162,7 +161,7 @@ func fetchDiscordUser(ctx context.Context, conf oauth2.Config, token *oauth2.Tok
 // database, then redirects back to the frontend with the session token as a
 // URL fragment (so the SPA can extract it).
 //
-//encore:api public raw method=GET path=/auth/callback/discord
+//encore:api public raw method=GET path=/api/auth/callback/discord
 func (s *Service) Callback(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 
@@ -174,8 +173,9 @@ func (s *Service) Callback(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// State format: <state_value>:<redirect_path>
-	// Split to recover state and redirect path
+	// New flows send a pure random state; the redirect target comes from the
+	// stored OAuth state row. The split below tolerates pre-fix
+	// <state>:<redirect> states still in flight.
 	parts := strings.SplitN(state, ":", 2)
 	var storedState, redirectTo string
 	if len(parts) == 2 {
@@ -201,7 +201,7 @@ func (s *Service) Callback(w http.ResponseWriter, req *http.Request) {
 		redirectTo = "/auth"
 	}
 
-	conf := s.discordOAuthConfig("/auth/callback/discord")
+	conf := s.discordOAuthConfig("/api/auth/callback/discord")
 
 	// Exchange code for token
 	token, err := conf.Exchange(ctx, code)
