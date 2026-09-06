@@ -385,15 +385,15 @@ function AdminEventDetailPage() {
         <SldsSkeletonDetail />
       ) : selectedEvent ? (
         <div className="slds-box bg-white" style={{ background: '#ffffff', borderRadius: '4px', border: '1px solid #dddbda', padding: '1.5rem' }}>
-          <div className="slds-grid slds-grid_align-spread slds-m-bottom_large" style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '2px solid #dddbda', paddingBottom: '1rem' }}>
-            <div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                <h2 className="slds-text-heading_medium font-bold text-slate-900" style={{ fontSize: '1.35rem', fontWeight: 'bold', margin: 0 }}>{selectedEvent.name}</h2>
+          <div className="slds-grid slds-grid_align-spread slds-m-bottom_large" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px', borderBottom: '2px solid #dddbda', paddingBottom: '1rem' }}>
+            <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: 0 }}>
+                <h2 className="slds-text-heading_medium font-bold text-slate-900" title={selectedEvent.name} style={{ fontSize: '1.35rem', fontWeight: 'bold', margin: 0, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{selectedEvent.name}</h2>
                 <button
                   type="button"
                   onClick={() => setShowEditEventModal(true)}
                   className="slds-button slds-button_neutral"
-                  style={{ padding: '2px 8px', fontSize: '11px' }}
+                  style={{ padding: '2px 8px', fontSize: '11px', flexShrink: 0 }}
                 >
                   Edit Details
                 </button>
@@ -402,7 +402,7 @@ function AdminEventDetailPage() {
                     type="button"
                     onClick={() => void handleRecomputeEventPoints()}
                     className="slds-button slds-button_neutral"
-                    style={{ padding: '2px 8px', fontSize: '11px' }}
+                    style={{ padding: '2px 8px', fontSize: '11px', flexShrink: 0 }}
                   >
                     Recompute Points
                   </button>
@@ -416,7 +416,7 @@ function AdminEventDetailPage() {
                       }
                     }}
                     className="slds-button slds-button_destructive"
-                    style={{ padding: '2px 8px', fontSize: '11px' }}
+                    style={{ padding: '2px 8px', fontSize: '11px', flexShrink: 0 }}
                   >
                     Delete Event
                   </button>
@@ -425,7 +425,7 @@ function AdminEventDetailPage() {
               <p className="slds-text-body_small text-slate-500">ID: {selectedEvent.id}</p>
             </div>
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '20px', flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
               {/* Signups Lock Controller */}
               <div className="slds-form-element" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <label className="slds-form-element__label font-bold text-slate-700" style={{ fontWeight: 'bold', margin: 0 }}>Signups:</label>
