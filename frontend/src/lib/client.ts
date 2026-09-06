@@ -16,7 +16,7 @@ export const Local: BaseURL = "http://localhost:4000"
  * Environment returns a BaseURL for calling the cloud environment with the given name.
  */
 export function Environment(name: string): BaseURL {
-    return `https://${name}-lightwing2-uxgi.encr.app`
+    return `https://${name}-poow4.encr.app`
 }
 
 /**
@@ -29,12 +29,11 @@ export function PreviewEnv(pr: number | string): BaseURL {
 const BROWSER = typeof globalThis === "object" && ("window" in globalThis);
 
 /**
- * Client is an API client for the lightwing2-uxgi Encore application.
+ * Client is an API client for the poow4 Encore application.
  */
 export default class Client {
     public readonly auth: auth.ServiceClient
     public readonly eventmanager: eventmanager.ServiceClient
-    public readonly hello: hello.ServiceClient
     public readonly teammanager: teammanager.ServiceClient
     private readonly options: ClientOptions
     private readonly target: string
@@ -52,7 +51,6 @@ export default class Client {
         const base = new BaseClient(this.target, this.options)
         this.auth = new auth.ServiceClient(base)
         this.eventmanager = new eventmanager.ServiceClient(base)
-        this.hello = new hello.ServiceClient(base)
         this.teammanager = new teammanager.ServiceClient(base)
     }
 
@@ -86,8 +84,8 @@ export interface ClientOptions {
 
 export namespace auth {
     /**
-     * GetSessionResponse mirrors the session shape returned by better-auth's
-     * get-session and stored by the frontend in localStorage.
+     * GetSessionResponse mirrors the session shape returned by get-session and
+     * stored by the frontend in localStorage.
      * 
      * Frontend stores: lightwing:session:token
      * Sends:   Authorization: Bearer ***
@@ -224,10 +222,6 @@ export namespace auth {
         constructor(baseClient: BaseClient) {
             this.baseClient = baseClient
             this.Callback = this.Callback.bind(this)
-            this.CompatDiscordCallback = this.CompatDiscordCallback.bind(this)
-            this.CompatGetSession = this.CompatGetSession.bind(this)
-            this.CompatSignInSocial = this.CompatSignInSocial.bind(this)
-            this.CompatSignOut = this.CompatSignOut.bind(this)
             this.GetSession = this.GetSession.bind(this)
             this.GetUser = this.GetUser.bind(this)
             this.GetUserBySlug = this.GetUserBySlug.bind(this)
@@ -243,56 +237,13 @@ export namespace auth {
          * fetches the user profile from Discord, upserts the user/account/session in the
          * database, then redirects back to the frontend with the session token as a
          * URL fragment (so the SPA can extract it).
-         * 
-         * Mirrors ts-legacy/auth/handler.ts GET /auth/callback/discord
          */
         public async Callback(method: "GET", body?: RequestInit["body"], options?: CallParameters): Promise<globalThis.Response> {
-            return this.baseClient.callAPI(method, `/auth/callback/discord`, body, options)
-        }
-
-        /**
-         * CompatDiscordCallback serves GET /api/auth/callback/discord: the OAuth
-         * redirect target registered with Discord. It validates state, exchanges the
-         * code, upserts user/account/session, sets the session cookie, and redirects
-         * to the frontend. Failures redirect with ?error=&error_description= so the
-         * /auth page can display them (see ts-legacy/frontend/src/routes/auth.tsx).
-         */
-        public async CompatDiscordCallback(method: "GET", body?: RequestInit["body"], options?: CallParameters): Promise<globalThis.Response> {
             return this.baseClient.callAPI(method, `/api/auth/callback/discord`, body, options)
         }
 
         /**
-         * CompatGetSession serves GET /api/auth/get-session for the browser flow.
-         * 
-         * Mirrors the better-auth get-session call in ts-legacy/frontend/src/lib/auth.ts
-         * (cookie in, {session: {token, expiresAt}, user} out).
-         */
-        public async CompatGetSession(method: "GET", body?: RequestInit["body"], options?: CallParameters): Promise<globalThis.Response> {
-            return this.baseClient.callAPI(method, `/api/auth/get-session`, body, options)
-        }
-
-        /**
-         * CompatSignInSocial serves POST /api/auth/sign-in/social for the browser flow.
-         * 
-         * Mirrors the better-auth sign-in call in ts-legacy/frontend/src/lib/auth.ts
-         * ({provider, callbackURL, errorCallbackURL} in, {url, redirect} out).
-         */
-        public async CompatSignInSocial(method: "POST", body?: RequestInit["body"], options?: CallParameters): Promise<globalThis.Response> {
-            return this.baseClient.callAPI(method, `/api/auth/sign-in/social`, body, options)
-        }
-
-        /**
-         * CompatSignOut serves POST /api/auth/sign-out: deletes the session and
-         * clears the cookie. Idempotent like the TS sign-out.
-         */
-        public async CompatSignOut(method: "POST", body?: RequestInit["body"], options?: CallParameters): Promise<globalThis.Response> {
-            return this.baseClient.callAPI(method, `/api/auth/sign-out`, body, options)
-        }
-
-        /**
          * GetSession returns the session and user profile for the authenticated caller.
-         * 
-         * Mirrors ts-legacy/auth/auth.ts get-session endpoint
          */
         public async GetSession(): Promise<GetSessionResponse> {
             // Now make the actual call to the API
@@ -365,8 +316,6 @@ export namespace auth {
 
         /**
          * SignInSocial returns a redirect URL to start the Discord OAuth flow.
-         * 
-         * Mirrors ts-legacy/auth/handler.ts GET /auth/sign-in/social (Discord provider)
          */
         public async SignInSocial(params: SignInSocialParams): Promise<SignInSocialResponse> {
             // Convert our params into the objects we need for the request
@@ -381,8 +330,6 @@ export namespace auth {
 
         /**
          * SignOut deletes the caller's session.
-         * 
-         * Mirrors ts-legacy/auth/auth.ts sign-out
          */
         public async SignOut(): Promise<void> {
             await this.baseClient.callTypedAPI("POST", `/auth.SignOut`)
@@ -531,7 +478,7 @@ export namespace eventmanager {
         ownerType: string
         organizationId: string
         ownerUserId: string
-        tag?: string
+        tag: string
         scoringType: number
         scoringRulesMode: string
         customScoringTables: JSONValue
@@ -591,16 +538,12 @@ export namespace eventmanager {
 
     /**
      * DeleteEventRequest carries the event id plus the auth header (DELETE
-     * decodes the struct from query params). The id travels in the query string
-     * (rather than a :id path param) because this Encore version only accepts
-     * scalar params alongside path params.
-     * 
-     * Mirrors ts-legacy/eventmanager/events.ts deleteEvent (DELETE /api/events/:id).
+     * decodes the struct from query params).
      */
     export interface DeleteEventRequest {
         ID: string
         Authorization: string
-        permanent?: boolean
+        Permanent: boolean
     }
 
     /**
@@ -700,7 +643,7 @@ export namespace eventmanager {
         ownerUserId: string
         status: string
         tag: string
-        deletedAt?: string | null
+        deletedAt: string
         scoringType: number
         scoringTypeLabel: string
         scoringRulesMode: string
@@ -732,7 +675,7 @@ export namespace eventmanager {
         ownerUserId: string
         status: string
         tag: string
-        deletedAt?: string | null
+        deletedAt: string
         scoringType: number
         scoringTypeLabel: string
         classRestriction: string
@@ -827,9 +770,9 @@ export namespace eventmanager {
     export interface ListEventsQuery {
         OrganizationID: string
         ClassRestriction: string
-        Status?: string
-        Tag?: string
-        IncludeDeleted?: boolean
+        Status: string
+        Tag: string
+        IncludeDeleted: boolean
         Limit: number
         Offset: number
     }
@@ -1091,6 +1034,14 @@ export namespace eventmanager {
     }
 
     /**
+     * RestoreEventRequest carries the event id plus the auth header.
+     */
+    export interface RestoreEventRequest {
+        id: string
+        Authorization: string
+    }
+
+    /**
      * SetEventPointsRequest mirrors SetPointsParams (PUT /api/events/:id/points/:userId).
      */
     export interface SetEventPointsRequest {
@@ -1114,18 +1065,13 @@ export namespace eventmanager {
 
     /**
      * SetEventStatusRequest mirrors SetStatusParams (PUT /api/events/:id/status).
-     * Endorsing an event as OFFICIAL is reserved for site administrators.
+     * Endorsing an event with OFFICIAL tag is reserved for site administrators.
      */
     export interface SetEventStatusRequest {
         id: string
         Authorization: string
-        status?: string
-        tag?: string
-    }
-
-    export interface RestoreEventRequest {
-        id: string
-        Authorization: string
+        status: string
+        tag: string
     }
 
     /**
@@ -1171,6 +1117,7 @@ export namespace eventmanager {
         Authorization: string
         name: string
         description: OptString
+        tag: string
         scoringRulesMode: string
         customScoringTables: JSONValue
         classRestriction: OptString
@@ -1220,7 +1167,6 @@ export namespace eventmanager {
             this.CreateRaceEvent = this.CreateRaceEvent.bind(this)
             this.DeleteEvent = this.DeleteEvent.bind(this)
             this.DeleteRaceEvent = this.DeleteRaceEvent.bind(this)
-            this.RestoreEvent = this.RestoreEvent.bind(this)
             this.DeleteRaceResult = this.DeleteRaceResult.bind(this)
             this.GetEvent = this.GetEvent.bind(this)
             this.GetRaceEvent = this.GetRaceEvent.bind(this)
@@ -1245,6 +1191,7 @@ export namespace eventmanager {
             this.RemoveRaceEventMember = this.RemoveRaceEventMember.bind(this)
             this.ReorderRaceEvents = this.ReorderRaceEvents.bind(this)
             this.ReplaceRaceResults = this.ReplaceRaceResults.bind(this)
+            this.RestoreEvent = this.RestoreEvent.bind(this)
             this.SetEventPoints = this.SetEventPoints.bind(this)
             this.SetEventSignupsLocked = this.SetEventSignupsLocked.bind(this)
             this.SetEventStatus = this.SetEventStatus.bind(this)
@@ -1436,24 +1383,13 @@ export namespace eventmanager {
             })
 
             const query = makeRecord<string, string | string[]>({
-                id: params.ID,
-                permanent: params.permanent ? "true" : undefined,
+                id:        params.ID,
+                permanent: String(params.Permanent),
             })
 
             // Now make the actual call to the API
             const resp = await this.baseClient.callTypedAPI("DELETE", `/api/events`, undefined, {headers, query})
             return await resp.json() as DeleteEventResponse
-        }
-
-        public async RestoreEvent(params: RestoreEventRequest): Promise<EventDetail> {
-            const headers = makeRecord<string, string>({
-                authorization: params.Authorization,
-            })
-            const body: Record<string, any> = {
-                id: params.id,
-            }
-            const resp = await this.baseClient.callTypedAPI("POST", `/api/event-restore`, JSON.stringify(body), {headers})
-            return await resp.json() as EventDetail
         }
 
         public async DeleteRaceEvent(params: DeleteRaceEventRequest): Promise<DeleteRaceEventResponse> {
@@ -1609,12 +1545,12 @@ export namespace eventmanager {
             // Convert our params into the objects we need for the request
             const query = makeRecord<string, string | string[]>({
                 classRestriction: params.ClassRestriction,
-                status:           params.Status,
-                tag:              params.Tag,
-                includeDeleted:   params.IncludeDeleted ? "true" : undefined,
+                includeDeleted:   String(params.IncludeDeleted),
                 limit:            String(params.Limit),
                 offset:           String(params.Offset),
                 organizationId:   params.OrganizationID,
+                status:           params.Status,
+                tag:              params.Tag,
             })
 
             // Now make the actual call to the API
@@ -1805,6 +1741,22 @@ export namespace eventmanager {
             return await resp.json() as RaceResultsResponse
         }
 
+        public async RestoreEvent(params: RestoreEventRequest): Promise<EventDetail> {
+            // Convert our params into the objects we need for the request
+            const headers = makeRecord<string, string>({
+                authorization: params.Authorization,
+            })
+
+            // Construct the body with only the fields which we want encoded within the body (excluding query string or header fields)
+            const body: Record<string, any> = {
+                id: params.id,
+            }
+
+            // Now make the actual call to the API
+            const resp = await this.baseClient.callTypedAPI("POST", `/api/event-restore`, JSON.stringify(body), {headers})
+            return await resp.json() as EventDetail
+        }
+
         public async SetEventPoints(params: SetEventPointsRequest): Promise<EventDetail> {
             // Convert our params into the objects we need for the request
             const headers = makeRecord<string, string>({
@@ -1911,6 +1863,7 @@ export namespace eventmanager {
                 participantLimit:                params.participantLimit,
                 scheduledAt:                     params.scheduledAt,
                 scoringRulesMode:                params.scoringRulesMode,
+                tag:                             params.tag,
             }
 
             // Now make the actual call to the API
@@ -1954,53 +1907,12 @@ export namespace eventmanager {
 }
 
 /**
- * Service hello implements a simple hello world REST API.
- */
-export namespace hello {
-    export interface Response {
-        Message: string
-    }
-
-    export class ServiceClient {
-        private baseClient: BaseClient
-
-        constructor(baseClient: BaseClient) {
-            this.baseClient = baseClient
-            this.Index = this.Index.bind(this)
-            this.World = this.World.bind(this)
-        }
-
-        /**
-         * Landing page with usage instructions.
-         */
-        public async Index(method: string, path: string[], body?: RequestInit["body"], options?: CallParameters): Promise<globalThis.Response> {
-            return this.baseClient.callAPI(method, `/${path.map(encodeURIComponent).join("/")}`, body, options)
-        }
-
-        /**
-         * This is a public REST API that responds with a personalized greeting.
-         * Learn more about defining APIs with Encore:
-         * https://encore.dev/docs/primitives/services-and-apis
-         * 
-         * To call it, run in your terminal:
-         * 
-         * 	curl http://localhost:4000/hello/World
-         */
-        public async World(name: string): Promise<Response> {
-            // Now make the actual call to the API
-            const resp = await this.baseClient.callTypedAPI("POST", `/hello/${encodeURIComponent(name)}`)
-            return await resp.json() as Response
-        }
-    }
-}
-
-/**
  * Package teammanager implements team (organization) management: teams,
  * membership, and aggregate team statistics.
  * 
  * Mirrors ts-legacy/teammanager/teams.ts, team-members.ts, team-stats.ts,
  * and team-guards.ts. A team is modelled as a better-auth organization row;
- * all state lives in the shared lightwing database (shared.DB).
+ * all state lives in the shared lightwing database (db).
  */
 export namespace teammanager {
     /**
@@ -2556,7 +2468,7 @@ class BaseClient {
         // Add User-Agent header if the script is running in the server
         // because browsers do not allow setting User-Agent headers to requests
         if (!BROWSER) {
-            this.headers["User-Agent"] = "lightwing2-uxgi-Generated-TS-Client (Encore/v1.58.4)";
+            this.headers["User-Agent"] = "poow4-Generated-TS-Client (Encore/v1.58.4)";
         }
 
         this.requestInit = options.requestInit ?? {};

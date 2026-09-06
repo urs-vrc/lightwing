@@ -438,8 +438,8 @@ export async function updateAdminEventStatus(
     return appClient.eventmanager.SetEventStatus({
       id: eventId,
       Authorization: authorization,
-      status: params.status,
-      tag: params.tag,
+      status: params.status ?? '',
+      tag: params.tag ?? '',
     })
   }
 
@@ -452,7 +452,7 @@ export async function updateAdminEventStatus(
           ...(params.status === 'PENDING_DELETION'
             ? { deletedAt: new Date().toISOString() }
             : params.status
-            ? { deletedAt: null }
+            ? { deletedAt: '' }
             : {}),
           updatedAt: new Date().toISOString(),
         }
@@ -476,7 +476,7 @@ export async function deleteAdminEvent(
     return appClient.eventmanager.DeleteEvent({
       ID: eventId,
       Authorization: authorization,
-      permanent,
+      Permanent: permanent ?? false,
     })
   }
 
@@ -519,7 +519,7 @@ export async function restoreAdminEvent(
       ? {
           ...e,
           status: 'PENDING' as EventStatus,
-          deletedAt: null,
+          deletedAt: '',
           updatedAt: new Date().toISOString(),
         }
       : e,
