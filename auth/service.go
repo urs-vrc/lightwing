@@ -94,6 +94,7 @@ var secrets struct {
 	DISCORD_AUTH_CLIENT_SECRET string
 	DISCORD_BOT_TOKEN          string
 	SESSION_COOKIE_SECRET      string
+	LIGHTWING_FRONTEND_URL     string
 }
 
 // serviceSecrets is the auth service's resolved credentials: framework secret
@@ -104,6 +105,10 @@ type serviceSecrets struct {
 	DiscordAuthClientSecret string
 	DiscordBotToken         string
 	AuthBaseURL             string
+	// FrontendBaseURL is the public frontend origin OAuth callbacks redirect
+	// to. Framework secret first (the only way to set some vars in Encore
+	// Cloud), plain env as fallback, default for local dev.
+	FrontendBaseURL string
 	// SessionCookieSecret signs the session cookie. Empty in local dev yields
 	// an ephemeral key (sessions reset on restart) with a startup warning.
 	SessionCookieSecret string
@@ -123,6 +128,7 @@ func loadSecrets() *serviceSecrets {
 		DiscordAuthClientSecret: secretOrEnv(secrets.DISCORD_AUTH_CLIENT_SECRET, "DISCORD_AUTH_CLIENT_SECRET"),
 		DiscordBotToken:         secretOrEnv(secrets.DISCORD_BOT_TOKEN, "DISCORD_BOT_TOKEN"),
 		AuthBaseURL:             os.Getenv("ENCORERUNTIME_API_BASE_URL"),
+		FrontendBaseURL:         secretOrEnv(secrets.LIGHTWING_FRONTEND_URL, "LIGHTWING_FRONTEND_URL"),
 		SessionCookieSecret:     secretOrEnv(secrets.SESSION_COOKIE_SECRET, "SESSION_COOKIE_SECRET"),
 	}
 	if s.SessionCookieSecret == "" {

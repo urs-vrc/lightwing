@@ -147,41 +147,113 @@ export function formatSecondsToFinishTime(totalSeconds: number): string {
   return `${minutes}:${seconds.toFixed(1).padStart(4, '0')}`
 }
 
-// Parse a margin string into a gap in seconds. Supports lengths, noses, heads,
-// necks and shorthand like "2 1/2", "1/2", "3/4". Falls back to 0 for "—"/"".
+// Official netkeiba/JRA margin-to-time-difference table (seconds). Anchors are
+// the published values (ranges use their midpoint): dead-heat/nose/head 0,
+// neck 0-0.1, 1/2: 0.1, 3/4: 0.1-0.2, 1: 0.2, 1 1/4: 0.2, 1 1/2: 0.2-0.3,
+// 1 3/4: 0.3, 2: 0.3, 2 1/2: 0.4, 3: 0.5, 3 1/2: 0.6, 4: 0.7, 5: 0.8-0.9,
+// 6: 1.0, 7: 1.1-1.2, 8: 1.3, 9: 1.4-1.5, 10: 1.6, over-10 ("large margin")
+// 1.7+. Values between anchors interpolate linearly; beyond 10 lengths it
+// extrapolates at ~6 lengths per second.
+const MARGIN_LENGTH_TO_SECONDS: Array<[lengths: number, seconds: number]> = [
+  [0, 0], [0.5, 0.1], [0.75, 0.15], [1, 0.2], [1.25, 0.2],
+  [1.5, 0.25], [1.75, 0.3], [2, 0.3], [2.5, 0.4], [3, 0.5],
+  [3.5, 0.6], [4, 0.7], [5, 0.85], [6, 1.0], [7, 1.15],
+  [8, 1.3], [9, 1.45], [10, 1.6],
+]
+
+function lengthsToSeconds(lengths: number): number {
+  if (lengths <= 0) return 0
+  const table = MARGIN_LENGTH_TO_SECONDS
+  if (lengths >= 10) return 1.6 + (lengths - 10) / 6
+  for (let i = 1; i < table.length; i++) {
+    if (lengths <= table[i][0]) {
+      const [l0, t0] = table[i - 1]
+      const [l1, t1] = table[i]
+      if (l1 === l0) return t1
+      return t0 + ((lengths - l0) / (l1 - l0)) * (t1 - t0)
+    }
+  }
+  return 1.6
+}
+
+// Parse the numeric portion of a margin string into lengths. Returns null
+// when the string carries no recognizable length value.
+function parseMarginLengths(trimmed: string): number | null {
+  const match = trimmed.match(/^(?:(\d+)\s*[- ]\s*)?(\d+)\/(\d+)|^(\d+)/)
+  if (!match) {
+    // Bare "length" with no number means one length.
+    if (trimmed.includes('length') || trimmed.includes('馬身')) return 1
+    return null
+  }
+  let whole = 0
+  let fraction = 0
+  if (match[4]) {
+    whole = Number(match[4])
+  } else {
+    if (match[1]) {
+      whole = Number(match[1])
+    }
+    const num = Number(match[2])
+    const den = Number(match[3])
+    if (den !== 0) {
+      fraction = num / den
+    }
+  }
+  const lengths = whole + fraction
+  if (lengths === 0) {
+    if (trimmed.includes('length') || trimmed.includes('馬身')) return 1
+    return null
+  }
+  return lengths
+}
+
+// isZeroDiffMargin reports whether a margin is a recognized "same time"
+// margin (dead-heat/nose/head) as opposed to an empty or unparseable value.
+function isZeroDiffMargin(trimmed: string): boolean {
+  return (
+    trimmed.includes('dead heat') ||
+    trimmed.includes('dead-heat') ||
+    trimmed === 'dh' ||
+    trimmed.includes('同着') ||
+    trimmed.includes('nose') ||
+    trimmed.includes('ハナ') ||
+    trimmed.includes('head') ||
+    trimmed.includes('アタマ')
+  )
+}
+
+// isParsableMargin reports whether a margin string is a recognized netkeiba
+// margin — including genuine zero-difference margins (nose/head/dead-heat),
+// which are valid and infer the same time as the horse ahead.
+export function isParsableMargin(value: string): boolean {
+  const trimmed = value.trim().toLowerCase()
+  if (!trimmed || trimmed === '—' || trimmed === '-' || trimmed === '0') return false
+  if (isZeroDiffMargin(trimmed)) return true
+  if (trimmed.includes('neck') || trimmed.includes('クビ')) return true
+  if (trimmed.includes('大差') || trimmed.includes('large margin')) return true
+  return parseMarginLengths(trimmed) !== null
+}
+
+// Neck (クビ) is officially 0-0.1s; use the midpoint for deterministic inference.
+const NECK_SECONDS = 0.05
+// "Large margin" (大差, 11+ lengths) is officially 1.7s+.
+const LARGE_MARGIN_SECONDS = 1.7
+
+// Parse a margin string into a gap in seconds using netkeiba margins.
+// Supports lengths, nose/head/neck (plus ハナ/アタマ/クビ/同着/大差/馬身)
+// and shorthand like "2 1/2", "1/2", "3/4". Falls back to 0 for "—"/"".
 export function parseMarginToSeconds(value: string): number {
   const trimmed = value.trim().toLowerCase()
   if (!trimmed || trimmed === '—' || trimmed === '-' || trimmed === '0') return 0
 
-  let whole = 0
-  let fraction = 0
+  if (isZeroDiffMargin(trimmed)) return 0
+  if (trimmed.includes('neck') || trimmed.includes('クビ')) return NECK_SECONDS
+  if (trimmed.includes('大差') || trimmed.includes('large margin')) return LARGE_MARGIN_SECONDS
 
-  const match = trimmed.match(/^(?:(\d+)\s*[- ]\s*)?(\d+)\/(\d+)|^(\d+)/)
-  if (match) {
-    if (match[4]) {
-      whole = Number(match[4])
-    } else {
-      if (match[1]) {
-        whole = Number(match[1])
-      }
-      const num = Number(match[2])
-      const den = Number(match[3])
-      if (den !== 0) {
-        fraction = num / den
-      }
-    }
-  }
-
-  let base = whole + fraction
-  if (base === 0 && (trimmed.includes('nose') || trimmed.includes('head') || trimmed.includes('neck') || trimmed.includes('length'))) {
-    base = 1
-  }
-
-  if (trimmed.includes('nose')) return base * 0.05
-  if (trimmed.includes('head')) return base * 0.15
-  if (trimmed.includes('neck')) return base * 0.25
-  // Default unit is "length" (~2 horse lengths per second in flat racing).
-  return base * 0.5
+  const lengths = parseMarginLengths(trimmed)
+  if (lengths === null) return 0
+  // Default unit is lengths (bare numbers and fractions like "1/2" included).
+  return lengthsToSeconds(lengths)
 }
 
 // Infer missing finish times from the leader's time and ordered per-position margins.
@@ -252,14 +324,12 @@ export function inferFinishTimes(
     const marginStr = (row.edit.margin ?? '').trim()
 
     const isZeroEquivalent = !marginStr || marginStr === '0' || marginStr === '—' || marginStr === '-'
-    let gapSeconds = 0
-    if (!isZeroEquivalent) {
-      gapSeconds = parseMarginToSeconds(marginStr)
-    }
-
-    if (isZeroEquivalent || gapSeconds === 0) {
+    // Nose/head/dead-heat are genuine zero-difference margins (same time as
+    // the horse ahead); only empty or unrecognized margins block inference.
+    if (isZeroEquivalent || !isParsableMargin(marginStr)) {
       return { error: `Position ${pos} has an empty or zero margin, which blocks cumulative inference.` }
     }
+    const gapSeconds = parseMarginToSeconds(marginStr)
 
     const currentSeconds = previousSeconds + gapSeconds
     nextEdits[row.member.userId] = {

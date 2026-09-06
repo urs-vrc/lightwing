@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { inferFinishTimes, type DerivedRow, type EditedResult, EMPTY_EDIT } from "./standings";
+import { inferFinishTimes, parseMarginToSeconds, type DerivedRow, type EditedResult, EMPTY_EDIT } from "./standings";
 
 function makeMockRow(
   userId: string,
@@ -27,10 +27,10 @@ function makeMockRow(
 
 describe("inferFinishTimes", () => {
   test("standard contiguous positions with cumulative margins", () => {
-    // Cumulative:
+    // Cumulative (netkeiba scale):
     // pos 1: 1:30.0
-    // pos 2: 1:30.0 + 1 1/2 lengths (0.75s) = 1:30.7 (or actually 1.5 * 0.5 = 0.75s -> formatted is 1:30.8 since .toFixed(1) rounds)
-    // pos 3: 1:30.8 + nose (0.05s) = 1:30.8 (1:30.75 + 0.05 = 1:30.8)
+    // pos 2: 1:30.0 + 1 1/2 lengths (0.25s) = 1:30.25 -> formatted 1:30.3
+    // pos 3: 1:30.25 + nose (0s) = 1:30.3
     const rows = [
       makeMockRow("user1", "1", "1:30.0", ""),
       makeMockRow("user2", "2", "", "1 1/2"),
@@ -48,18 +48,18 @@ describe("inferFinishTimes", () => {
     expect("error" in result).toBe(false);
     if (!("error" in result)) {
       expect(result.inferredCount).toBe(2);
-      // user2: 1:30.0 + (1.5 * 0.5) = 1:30.75 -> formatted 1:30.8
-      expect(result.edits.user2.finishTime).toBe("1:30.8");
-      // user3: 1:30.75 + 0.05 = 1:30.80 -> formatted 1:30.8
-      expect(result.edits.user3.finishTime).toBe("1:30.8");
+      // user2: 1:30.0 + 0.25 = 1:30.25 -> formatted 1:30.3
+      expect(result.edits.user2.finishTime).toBe("1:30.3");
+      // user3: 1:30.25 + 0 = 1:30.25 -> formatted 1:30.3
+      expect(result.edits.user3.finishTime).toBe("1:30.3");
     }
   });
 
   test("more distinct cumulative math", () => {
-    // Cumulative:
+    // Cumulative (netkeiba scale):
     // pos 1: 1:20.0 (80.0s)
-    // pos 2: + 2 lengths (1.0s) = 1:21.0
-    // pos 3: + 3 lengths (1.5s) = 1:22.5
+    // pos 2: + 2 lengths (0.3s) = 1:20.3
+    // pos 3: + 3 lengths (0.5s) = 1:20.8
     const rows = [
       makeMockRow("user1", "1", "1:20.0", ""),
       makeMockRow("user2", "2", "", "2"),
@@ -75,8 +75,8 @@ describe("inferFinishTimes", () => {
     expect("error" in result).toBe(false);
     if (!("error" in result)) {
       expect(result.inferredCount).toBe(2);
-      expect(result.edits.user2.finishTime).toBe("1:21.0");
-      expect(result.edits.user3.finishTime).toBe("1:22.5");
+      expect(result.edits.user2.finishTime).toBe("1:20.3");
+      expect(result.edits.user3.finishTime).toBe("1:20.8");
     }
   });
 
@@ -98,15 +98,15 @@ describe("inferFinishTimes", () => {
     expect("error" in result).toBe(false);
     if (!("error" in result)) {
       expect(result.inferredCount).toBe(2);
-      expect(result.edits.user2.finishTime).toBe("1:32.8");
-      expect(result.edits.user3.finishTime).toBe("1:32.8");
+      expect(result.edits.user2.finishTime).toBe("1:32.3");
+      expect(result.edits.user3.finishTime).toBe("1:32.3");
     }
   });
 
   test("repeated inference: rerun after changing upstream margin recalculates downstream cumulatively", () => {
     const rows = [
       makeMockRow("user1", "1", "1:20.0", ""),
-      makeMockRow("user2", "2", "1:21.0", "4"), // Changed margin from 2 to 4 lengths (2.0s)
+      makeMockRow("user2", "2", "1:21.0", "4"), // Changed margin from 2 to 4 lengths (0.7s)
       makeMockRow("user3", "3", "1:22.5", "3"),
     ];
 
@@ -119,8 +119,8 @@ describe("inferFinishTimes", () => {
     expect("error" in result).toBe(false);
     if (!("error" in result)) {
       expect(result.inferredCount).toBe(2);
-      expect(result.edits.user2.finishTime).toBe("1:22.0");
-      expect(result.edits.user3.finishTime).toBe("1:23.5");
+      expect(result.edits.user2.finishTime).toBe("1:20.7");
+      expect(result.edits.user3.finishTime).toBe("1:21.2");
     }
   });
 
@@ -259,6 +259,38 @@ describe("inferFinishTimes", () => {
     }
   });
 
+  test("error on unrecognized margin text, but nose/head infer the same time", () => {
+    const garbageRows = [
+      makeMockRow("user1", "1", "1:30.0", ""),
+      makeMockRow("user2", "2", "", "foo"),
+    ];
+    const resultGarbage = inferFinishTimes(garbageRows, {
+      user1: garbageRows[0].edit,
+      user2: garbageRows[1].edit,
+    });
+    expect("error" in resultGarbage).toBe(true);
+    if ("error" in resultGarbage) {
+      expect(resultGarbage.error).toBe("Position 2 has an empty or zero margin, which blocks cumulative inference.");
+    }
+
+    const deadHeatRows = [
+      makeMockRow("user1", "1", "1:30.0", ""),
+      makeMockRow("user2", "2", "", "nose"),
+      makeMockRow("user3", "3", "", "head"),
+    ];
+    const resultDeadHeat = inferFinishTimes(deadHeatRows, {
+      user1: deadHeatRows[0].edit,
+      user2: deadHeatRows[1].edit,
+      user3: deadHeatRows[2].edit,
+    });
+    expect("error" in resultDeadHeat).toBe(false);
+    if (!("error" in resultDeadHeat)) {
+      expect(resultDeadHeat.inferredCount).toBe(2);
+      expect(resultDeadHeat.edits.user2.finishTime).toBe("1:30.0");
+      expect(resultDeadHeat.edits.user3.finishTime).toBe("1:30.0");
+    }
+  });
+
   test("rows with pending_delete are completely ignored", () => {
     const rows = [
       makeMockRow("user1", "1", "1:30.0", ""),
@@ -275,7 +307,7 @@ describe("inferFinishTimes", () => {
     expect("error" in result).toBe(false);
     if (!("error" in result)) {
       expect(result.inferredCount).toBe(1);
-      expect(result.edits.user2.finishTime).toBe("1:30.5");
+      expect(result.edits.user2.finishTime).toBe("1:30.2");
       expect(result.edits.user3.finishTime).toBe("");
     }
   });
@@ -305,12 +337,65 @@ describe("inferFinishTimes", () => {
     expect("error" in result).toBe(false);
     if (!("error" in result)) {
       expect(result.inferredCount).toBe(1);
-      // user4: 1:30.0 + 3 lengths (1.5s) = 1:31.5
-      expect(result.edits.user4.finishTime).toBe("1:31.5");
+      // user4: 1:30.0 + 3 lengths (0.5s) = 1:30.5
+      expect(result.edits.user4.finishTime).toBe("1:30.5");
       // DSQ/DNF/DNS rows were not modified
       expect(result.edits.user2.finishTime).toBe("");
       expect(result.edits.user3.finishTime).toBe("");
       expect(result.edits.user5.finishTime).toBe("");
+    }
+  });
+});
+
+describe("parseMarginToSeconds (netkeiba scale)", () => {
+  test("zero-equivalent inputs", () => {
+    expect(parseMarginToSeconds("")).toBe(0);
+    expect(parseMarginToSeconds("—")).toBe(0);
+    expect(parseMarginToSeconds("-")).toBe(0);
+    expect(parseMarginToSeconds("0")).toBe(0);
+  });
+
+  test("nose and head carry no time difference", () => {
+    expect(parseMarginToSeconds("nose")).toBe(0);
+    expect(parseMarginToSeconds("Nose")).toBe(0);
+    expect(parseMarginToSeconds("ハナ")).toBe(0);
+    expect(parseMarginToSeconds("head")).toBe(0);
+    expect(parseMarginToSeconds("アタマ")).toBe(0);
+    expect(parseMarginToSeconds("dead heat")).toBe(0);
+    expect(parseMarginToSeconds("同着")).toBe(0);
+  });
+
+  test("neck is distinct from a half length", () => {
+    expect(parseMarginToSeconds("neck")).toBeCloseTo(0.05, 9);
+    expect(parseMarginToSeconds("クビ")).toBeCloseTo(0.05, 9);
+    expect(parseMarginToSeconds("1/2")).toBeCloseTo(0.1, 9);
+  });
+
+  test("official length anchors", () => {
+    const cases: Array<[string, number]> = [
+      ["3/4", 0.15],
+      ["1", 0.2],
+      ["1 length", 0.2],
+      ["length", 0.2],
+      ["2馬身", 0.3],
+      ["1 1/4", 0.2],
+      ["1 1/2", 0.25],
+      ["1 3/4", 0.3],
+      ["2", 0.3],
+      ["2 1/2", 0.4],
+      ["3", 0.5],
+      ["3 1/2", 0.6],
+      ["4", 0.7],
+      ["5", 0.85],
+      ["6", 1.0],
+      ["7", 1.15],
+      ["8", 1.3],
+      ["9", 1.45],
+      ["10", 1.6],
+      ["大差", 1.7],
+    ];
+    for (const [input, want] of cases) {
+      expect(parseMarginToSeconds(input), input).toBeCloseTo(want, 9);
     }
   });
 });

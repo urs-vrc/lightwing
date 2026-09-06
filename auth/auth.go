@@ -235,7 +235,7 @@ func (s *Service) Callback(w http.ResponseWriter, req *http.Request) {
 
 	// Redirect back to the frontend with the session token in the URL fragment.
 	// The SPA extracts the fragment and stores it in localStorage.
-	frontendURL := strings.TrimSuffix(frontendBaseURL(), "/")
+	frontendURL := strings.TrimSuffix(s.frontendBaseURL(), "/")
 	parsedURL, err := url.Parse(frontendURL + redirectTo)
 	if err != nil {
 		http.Error(w, "invalid redirect URL", http.StatusInternalServerError)
@@ -280,8 +280,13 @@ func normalizeRedirectTarget(target string) string {
 	return target
 }
 
-// frontendBaseURL returns the configured frontend origin.
-func frontendBaseURL() string {
+// frontendBaseURL returns the configured frontend origin: framework secret
+// first (settable via `encore secret set LIGHTWING_FRONTEND_URL`), plain
+// environment as fallback, local-dev default otherwise.
+func (s *Service) frontendBaseURL() string {
+	if s != nil && s.secrets != nil && s.secrets.FrontendBaseURL != "" {
+		return s.secrets.FrontendBaseURL
+	}
 	if v := os.Getenv("LIGHTWING_FRONTEND_URL"); v != "" {
 		return v
 	}
