@@ -2,10 +2,12 @@ package eventmanager
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
 	"encore.dev/beta/errs"
 	"encore.app/auth"
+	"encore.app/eventmanager/sqlc"
 )
 
 // AddEventScheduleRequest carries the schedule payload plus the auth header.
@@ -23,10 +25,8 @@ type AddEventScheduleRequest struct {
 
 // AddEventScheduleCore adds a schedule slot to an event.
 func AddEventScheduleCore(ctx context.Context, p *AddEventScheduleRequest) (*EventDetail, error) {
-	var exists bool
-	if err := db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM "event" WHERE id = $1)`, p.EventID,
-	).Scan(&exists); err != nil {
+	exists, err := q().EventExists(ctx, p.EventID)
+	if err != nil {
 		return nil, err
 	}
 	if !exists {
@@ -50,10 +50,21 @@ func AddEventScheduleCore(ctx context.Context, p *AddEventScheduleRequest) (*Eve
 		endsAt = &utc
 	}
 
-	if _, err := db.Exec(ctx,
-		`INSERT INTO "event_schedule" (id, "eventId", title, "startsAt", "endsAt", location, "createdAt")
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		newID(), p.EventID, p.Title, startsAt.UTC(), endsAt, p.Location, time.Now().UTC()); err != nil {
+	var title, location sql.NullString
+	if p.Title != nil {
+		title = sql.NullString{String: *p.Title, Valid: true}
+	}
+	var endsAtNull sql.NullTime
+	if endsAt != nil {
+		endsAtNull = sql.NullTime{Time: *endsAt, Valid: true}
+	}
+	if p.Location != nil {
+		location = sql.NullString{String: *p.Location, Valid: true}
+	}
+	if err := q().InsertEventSchedule(ctx, sqlc.InsertEventScheduleParams{
+		ID: newID(), EventId: p.EventID, Title: title, StartsAt: startsAt.UTC(),
+		EndsAt: endsAtNull, Location: location, CreatedAt: time.Now().UTC(),
+	}); err != nil {
 		return nil, err
 	}
 	return LoadEvent(ctx, p.EventID)

@@ -16,6 +16,8 @@ import (
 	"encore.dev/beta/errs"
 	"encore.dev/rlog"
 	"golang.org/x/oauth2"
+
+	"encore.app/auth/sqlc"
 )
 
 // --- API Endpoint Input/Response Types ---
@@ -305,29 +307,25 @@ func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token
 	displayName := discordUser.Username
 	avatarURL := discordUserAvatarURL(discordUser)
 
-	userID := ""
-	err := db.QueryRow(ctx,
-		`SELECT "userId" FROM "account" WHERE "providerId" = 'discord' AND "accountId" = $1`,
-		discordUser.ID,
-	).Scan(&userID)
+	userID, err := q().GetDiscordUserID(ctx, discordUser.ID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", fmt.Errorf("failed to look up discord account: %w", err)
 	}
+	if errors.Is(err, sql.ErrNoRows) {
+		userID = ""
+	}
 
-	tx, err := db.Begin(ctx)
+	stx, err := db.Stdlib().BeginTx(ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer stx.Rollback()
+	qq := q().WithTx(stx)
 
-	var existingUserID string
-	err = tx.QueryRow(ctx,
-		`SELECT id FROM "user" WHERE id = $1`, userID,
-	).Scan(&existingUserID)
-
+	_, err = qq.GetUserByID(ctx, userID)
 	if errors.Is(err, sql.ErrNoRows) || userID == "" {
-		var userCount int
-		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM "user"`).Scan(&userCount); err != nil {
+		userCount, err := qq.CountUsers(ctx)
+		if err != nil {
 			return "", fmt.Errorf("failed to count users: %w", err)
 		}
 		siteRole := string(SiteRoleUser)
@@ -337,27 +335,25 @@ func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token
 		if userID == "" {
 			userID = generateID()
 		}
-		slug, err := GenerateUniqueUserSlug(db.Stdlib(), displayName, userID)
+		slug, err := GenerateUniqueUserSlug(ctx, db.Stdlib(), displayName, userID)
 		if err != nil {
 			return "", fmt.Errorf("failed to generate user slug: %w", err)
 		}
-		_, err = tx.Exec(ctx,
-			`INSERT INTO "user" (id, name, email, image, "siteRole", "vrchatUsername", slug, "createdAt", "updatedAt")
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-			userID, displayName, email, nullIfEmpty(avatarURL),
-			siteRole, "", slug, now, now,
-		)
+		err = qq.InsertUser(ctx, sqlc.InsertUserParams{
+			ID: userID, Name: displayName, Email: email, Image: nullIfEmpty(avatarURL),
+			SiteRole: siteRole, VrchatUsername: sql.NullString{String: "", Valid: true},
+			Slug: nullIfEmpty(slug), CreatedAt: now, UpdatedAt: now,
+		})
 		if err != nil {
 			return "", fmt.Errorf("failed to insert user: %w", err)
 		}
 	} else if err != nil {
 		return "", fmt.Errorf("failed to check existing user: %w", err)
 	} else {
-		_, err = tx.Exec(ctx,
-			`UPDATE "user" SET name = $1, email = $2, image = $3, "updatedAt" = $4
-			 WHERE id = $5`,
-			displayName, email, nullIfEmpty(avatarURL), now, userID,
-		)
+		err = qq.UpdateUserOnLogin(ctx, sqlc.UpdateUserOnLoginParams{
+			Name: displayName, Email: email, Image: nullIfEmpty(avatarURL),
+			UpdatedAt: now, ID: userID,
+		})
 		if err != nil {
 			return "", fmt.Errorf("failed to update user: %w", err)
 		}
@@ -368,66 +364,52 @@ func upsertUserAndSession(ctx context.Context, svc *Service, token *oauth2.Token
 	if !token.Expiry.IsZero() {
 		accessExpires = sql.NullTime{Time: token.Expiry.UTC(), Valid: true}
 	}
-	var existingAccountID string
-	err = tx.QueryRow(ctx,
-		`SELECT id FROM "account" WHERE "userId" = $1 AND "providerId" = 'discord'`,
-		userID,
-	).Scan(&existingAccountID)
+	existingAccountID, err := qq.GetDiscordAccountRowID(ctx, userID)
 	if errors.Is(err, sql.ErrNoRows) {
-		_, err = tx.Exec(ctx,
-			`INSERT INTO "account" (id, "accountId", "providerId", "userId", "accessToken",
-			                        "refreshToken", "scope", "accessTokenExpiresAt", "createdAt", "updatedAt")
-			 VALUES ($1, $2, 'discord', $3, $4, $5, $6, $7, $8, $8)`,
-			generateID(), discordUser.ID, userID, token.AccessToken,
-			nullIfEmpty(token.RefreshToken), nullIfEmpty(scope), accessExpires, now,
-		)
+		err = qq.InsertDiscordAccount(ctx, sqlc.InsertDiscordAccountParams{
+			ID: generateID(), AccountId: discordUser.ID, UserId: userID,
+			AccessToken: nullIfEmpty(token.AccessToken),
+			RefreshToken: nullIfEmpty(token.RefreshToken), Scope: nullIfEmpty(scope),
+			AccessTokenExpiresAt: accessExpires, CreatedAt: now,
+		})
 		if err != nil {
 			return "", fmt.Errorf("failed to insert account: %w", err)
 		}
 	} else if err != nil {
 		return "", fmt.Errorf("failed to check existing account: %w", err)
 	} else {
-		_, err = tx.Exec(ctx,
-			`UPDATE "account" SET "accessToken" = $1, "refreshToken" = $2, "scope" = $3,
-			                     "accessTokenExpiresAt" = $4, "updatedAt" = $5
-			 WHERE id = $6`,
-			token.AccessToken, nullIfEmpty(token.RefreshToken), nullIfEmpty(scope),
-			accessExpires, now, existingAccountID,
-		)
+		err = qq.UpdateDiscordAccount(ctx, sqlc.UpdateDiscordAccountParams{
+			AccessToken: nullIfEmpty(token.AccessToken),
+			RefreshToken: nullIfEmpty(token.RefreshToken), Scope: nullIfEmpty(scope),
+			AccessTokenExpiresAt: accessExpires, UpdatedAt: now, ID: existingAccountID,
+		})
 		if err != nil {
 			return "", fmt.Errorf("failed to update account: %w", err)
 		}
 	}
 
-	var activeOrgID string
-	err = tx.QueryRow(ctx,
-		`SELECT "organizationId" FROM "member" WHERE "userId" = $1 ORDER BY "createdAt" ASC LIMIT 1`,
-		userID,
-	).Scan(&activeOrgID)
+	activeOrgID, err := qq.GetMemberActiveOrg(ctx, userID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", fmt.Errorf("failed to fetch active org: %w", err)
 	}
+	if errors.Is(err, sql.ErrNoRows) {
+		activeOrgID = ""
+	}
 
-	_, err = tx.Exec(ctx,
-		`DELETE FROM "session" WHERE "userId" = $1`,
-		userID,
-	)
-	if err != nil {
+	if err := qq.DeleteSessionsByUser(ctx, userID); err != nil {
 		return "", fmt.Errorf("failed to delete old sessions: %w", err)
 	}
 
-	_, err = tx.Exec(ctx,
-		`INSERT INTO "session" (id, "userId", token, "activeOrganizationId", "expiresAt", "createdAt", "updatedAt")
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		generateID(), userID, sessionToken,
-		sql.NullString{String: activeOrgID, Valid: activeOrgID != ""},
-		expiresAt, now, now,
-	)
+	err = qq.InsertSession(ctx, sqlc.InsertSessionParams{
+		ID: generateID(), UserId: userID, Token: sessionToken,
+		ActiveOrganizationId: sql.NullString{String: activeOrgID, Valid: activeOrgID != ""},
+		ExpiresAt: expiresAt, CreatedAt: now, UpdatedAt: now,
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to insert session: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := stx.Commit(); err != nil {
 		return "", fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
@@ -474,9 +456,7 @@ func getSessionData(ctx context.Context, token string, hasCookie bool) (*GetSess
 	}
 
 	var expiresAt time.Time
-	err = db.QueryRow(ctx,
-		`SELECT "expiresAt" FROM "session" WHERE "token" = $1`, token,
-	).Scan(&expiresAt)
+	expiresAt, err = q().GetSessionExpiry(ctx, token)
 	if err != nil {
 		return nil, &errs.Error{Code: errs.Internal, Message: "failed to load session"}
 	}
@@ -519,8 +499,7 @@ func signOutSession(ctx context.Context, token string) error {
 	if actorCache != nil {
 		_, _ = actorCache.Delete(ctx, actorCacheKey{Token: token})
 	}
-	_, err := db.Exec(ctx, `DELETE FROM "session" WHERE "token" = $1`, token)
-	return err
+	return q().DeleteSessionByToken(ctx, token)
 }
 
 // --- Token Extraction ---

@@ -8,6 +8,7 @@ import (
 
 	"encore.dev/beta/errs"
 	"encore.app/auth"
+	"encore.app/eventmanager/sqlc"
 )
 
 // Event scoring endpoints: points overview, ladder matches, status changes,
@@ -35,21 +36,21 @@ func SetEventPointsCore(ctx context.Context, p *SetEventPointsRequest) (*EventDe
 	if e.ScoringType != ScoringPoints {
 		return nil, &errs.Error{Code: errs.FailedPrecondition, Message: "event is not points-based"}
 	}
-	var memberExists bool
-	if err := db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM "event_member" WHERE "eventId"=$1 AND "userId"=$2)`,
-		p.ID, p.UserID).Scan(&memberExists); err != nil {
+	memberExists, err := q().EventMemberExists(ctx, sqlc.EventMemberExistsParams{
+		EventId: p.ID,
+		UserId:  p.UserID,
+	})
+	if err != nil {
 		return nil, err
 	}
 	if !memberExists {
 		return nil, &errs.Error{Code: errs.FailedPrecondition, Message: "user is not a member of this event"}
 	}
 	now := time.Now().UTC()
-	if _, err := db.Exec(ctx,
-		`INSERT INTO "event_points_entry" (id, "eventId", "userId", points, "createdAt", "updatedAt")
-		 VALUES ($1,$2,$3,$4,$5,$5)
-		 ON CONFLICT ("eventId", "userId") DO UPDATE SET points=$4, "updatedAt"=$5`,
-		"eventpoints-"+newID()[:8], p.ID, p.UserID, p.Points, now); err != nil {
+	if err := q().UpsertEventPointsEntry(ctx, sqlc.UpsertEventPointsEntryParams{
+		ID: "eventpoints-" + newID()[:8], EventId: p.ID, UserId: p.UserID,
+		Points: int32(p.Points), CreatedAt: now,
+	}); err != nil {
 		return nil, err
 	}
 	return LoadEvent(ctx, p.ID)
@@ -91,10 +92,11 @@ func RecordLadderMatchCore(ctx context.Context, p *LadderMatchRequest) (*EventDe
 		{p.WinnerID, "winner"},
 		{p.LoserID, "loser"},
 	} {
-		var memberExists bool
-		if err := db.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM "event_member" WHERE "eventId"=$1 AND "userId"=$2)`,
-			p.ID, m.userID).Scan(&memberExists); err != nil {
+		memberExists, err := q().EventMemberExists(ctx, sqlc.EventMemberExistsParams{
+			EventId: p.ID,
+			UserId:  m.userID,
+		})
+		if err != nil {
 			return nil, err
 		}
 		if !memberExists {
@@ -110,14 +112,14 @@ func RecordLadderMatchCore(ctx context.Context, p *LadderMatchRequest) (*EventDe
 		return nil, err
 	}
 	updated := ComputeElo(winnerElo, loserElo)
-	if _, err := db.Exec(ctx,
-		`UPDATE "event_ladder_entry" SET elo=$1, wins=wins+1 WHERE "eventId"=$2 AND "userId"=$3`,
-		updated.WinnerElo, p.ID, p.WinnerID); err != nil {
+	if err := q().RecordLadderWin(ctx, sqlc.RecordLadderWinParams{
+		Elo: int32(updated.WinnerElo), EventId: p.ID, UserId: p.WinnerID,
+	}); err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(ctx,
-		`UPDATE "event_ladder_entry" SET elo=$1, losses=losses+1 WHERE "eventId"=$2 AND "userId"=$3`,
-		updated.LoserElo, p.ID, p.LoserID); err != nil {
+	if err := q().RecordLadderLoss(ctx, sqlc.RecordLadderLossParams{
+		Elo: int32(updated.LoserElo), EventId: p.ID, UserId: p.LoserID,
+	}); err != nil {
 		return nil, err
 	}
 	return LoadEvent(ctx, p.ID)
@@ -126,27 +128,27 @@ func RecordLadderMatchCore(ctx context.Context, p *LadderMatchRequest) (*EventDe
 // getOrCreateLadderElo fetches a ladder entry's elo, creating a 1200-rated
 // entry when absent.
 func getOrCreateLadderElo(ctx context.Context, eventID, userID string) (int, error) {
-	var elo int
-	err := db.QueryRow(ctx,
-		`SELECT elo FROM "event_ladder_entry" WHERE "eventId"=$1 AND "userId"=$2`,
-		eventID, userID).Scan(&elo)
+	elo32, err := q().GetLadderElo(ctx, sqlc.GetLadderEloParams{
+		EventId: eventID,
+		UserId:  userID,
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		now := time.Now().UTC()
-		if _, err := db.Exec(ctx,
-			`INSERT INTO "event_ladder_entry" (id, "eventId", "userId", elo, "createdAt")
-			 VALUES ($1,$2,$3,1200,$4)
-			 ON CONFLICT ("eventId", "userId") DO NOTHING`,
-			"ladder-"+newID()[:8], eventID, userID, now); err != nil {
+		if err := q().InsertLadderEntry(ctx, sqlc.InsertLadderEntryParams{
+			ID: "ladder-" + newID()[:8], EventId: eventID, UserId: userID, CreatedAt: now,
+		}); err != nil {
 			return 0, err
 		}
-		if err := db.QueryRow(ctx,
-			`SELECT elo FROM "event_ladder_entry" WHERE "eventId"=$1 AND "userId"=$2`,
-			eventID, userID).Scan(&elo); err != nil {
+		elo32, err := q().GetLadderElo(ctx, sqlc.GetLadderEloParams{
+			EventId: eventID,
+			UserId:  userID,
+		})
+		if err != nil {
 			return 0, err
 		}
-		return elo, nil
+		return int(elo32), nil
 	}
-	return elo, err
+	return int(elo32), err
 }
 
 //encore:api public method=POST path=/api/event-ladder-matches
@@ -183,7 +185,9 @@ func SetEventStatusCore(ctx context.Context, p *SetEventStatusRequest) (*EventDe
 		} else if _, err := auth.RequireEventPermission(ctx, p.Authorization, p.ID, auth.ActionUpdate); err != nil {
 			return nil, err
 		}
-		if _, err := db.Exec(ctx, `UPDATE "event" SET tag=$1 WHERE id=$2`, tag, p.ID); err != nil {
+		if err := q().UpdateEventTag(ctx, sqlc.UpdateEventTagParams{
+			Tag: tag, ID: p.ID,
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -198,11 +202,15 @@ func SetEventStatusCore(ctx context.Context, p *SetEventStatusRequest) (*EventDe
 		}
 		if st == "PENDING_DELETION" {
 			now := time.Now().UTC()
-			if _, err := db.Exec(ctx, `UPDATE "event" SET status=$1, "deletedAt"=$2 WHERE id=$3`, st, now, p.ID); err != nil {
+			if err := q().UpdateEventStatusWithDeletion(ctx, sqlc.UpdateEventStatusWithDeletionParams{
+				Status: st, DeletedAt: sql.NullTime{Time: now, Valid: true}, ID: p.ID,
+			}); err != nil {
 				return nil, err
 			}
 		} else {
-			if _, err := db.Exec(ctx, `UPDATE "event" SET status=$1, "deletedAt"=NULL WHERE id=$2`, st, p.ID); err != nil {
+			if err := q().UpdateEventStatus(ctx, sqlc.UpdateEventStatusParams{
+				Status: st, ID: p.ID,
+			}); err != nil {
 				return nil, err
 			}
 		}

@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"encore.dev/storage/sqldb"
+
+	"encore.app/auth/sqlc"
 )
 
 // slugify normalizes a string into a URL-friendly slug (lowercase, hyphen-separated).
@@ -142,7 +144,8 @@ func truncate(s string, max int) string {
 // of the user's Discord account ID.
 //
 // Mirrors ts-legacy/lib/slugs.ts generateUniqueUserSlug
-func GenerateUniqueUserSlug(db *sql.DB, baseName string, userId string) (string, error) {
+func GenerateUniqueUserSlug(ctx context.Context, db *sql.DB, baseName string, userId string) (string, error) {
+	qq := sqlc.New(db)
 	// Normalize name to lowercase alphanumeric
 	base := toLowerAlnum(baseName)
 
@@ -157,8 +160,7 @@ func GenerateUniqueUserSlug(db *sql.DB, baseName string, userId string) (string,
 	slug := base
 	if isValid {
 		// Check collision
-		var existingId string
-		err := db.QueryRow(`SELECT id FROM "user" WHERE slug = $1`, slug).Scan(&existingId)
+		existingId, err := qq.GetUserBySlug(ctx, sql.NullString{String: slug, Valid: true})
 		if err == nil {
 			if existingId == userId {
 				return slug, nil
@@ -175,7 +177,7 @@ func GenerateUniqueUserSlug(db *sql.DB, baseName string, userId string) (string,
 		for {
 			suffix := fmt.Sprintf("%d", counter)
 			tempSlug := truncate(base, 24-len(suffix)) + suffix
-			err := db.QueryRow(`SELECT id FROM "user" WHERE slug = $1`, tempSlug).Scan(&existingId)
+			existingId, err := qq.GetUserBySlug(ctx, sql.NullString{String: tempSlug, Valid: true})
 			if errors.Is(err, sql.ErrNoRows) || (err == nil && existingId == userId) {
 				return tempSlug, nil
 			}
@@ -187,11 +189,7 @@ func GenerateUniqueUserSlug(db *sql.DB, baseName string, userId string) (string,
 	}
 
 	// Default to using a derivative of their Discord ID
-	var discordId string
-	err := db.QueryRow(
-		`SELECT "accountId" FROM "account" WHERE "userId" = $1 AND "providerId" = 'discord' ORDER BY "updatedAt" DESC LIMIT 1`,
-		userId,
-	).Scan(&discordId)
+	discordId, err := qq.GetDiscordAccountID(ctx, userId)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", fmt.Errorf("failed to fetch discord account: %w", err)
 	}
@@ -211,8 +209,7 @@ func GenerateUniqueUserSlug(db *sql.DB, baseName string, userId string) (string,
 
 	counter := 2
 	for {
-		var existingId string
-		err := db.QueryRow(`SELECT id FROM "user" WHERE slug = $1`, slug).Scan(&existingId)
+		existingId, err := qq.GetUserBySlug(ctx, sql.NullString{String: slug, Valid: true})
 		if errors.Is(err, sql.ErrNoRows) || (err == nil && existingId == userId) {
 			break
 		}
@@ -230,7 +227,8 @@ func GenerateUniqueUserSlug(db *sql.DB, baseName string, userId string) (string,
 // GenerateUniqueOrgSlug generates a unique organization slug starting from a base name.
 //
 // Mirrors ts-legacy/lib/slugs.ts generateUniqueOrgSlug
-func GenerateUniqueOrgSlug(db *sql.DB, baseName string) (string, error) {
+func GenerateUniqueOrgSlug(ctx context.Context, db *sql.DB, baseName string) (string, error) {
+	qq := sqlc.New(db)
 	base := slugify(baseName)
 	if base == "" || len(base) < 3 {
 		base = "team"
@@ -246,8 +244,7 @@ func GenerateUniqueOrgSlug(db *sql.DB, baseName string) (string, error) {
 
 	counter := 2
 	for {
-		var existingId string
-		err := db.QueryRow(`SELECT id FROM "organization" WHERE slug = $1`, slug).Scan(&existingId)
+		_, err := qq.GetOrgBySlug(ctx, slug)
 		if errors.Is(err, sql.ErrNoRows) && !isReservedSlug(slug) {
 			return slug, nil
 		}
@@ -267,34 +264,32 @@ func GenerateUniqueOrgSlug(db *sql.DB, baseName string) (string, error) {
 //
 // Mirrors ts-legacy/auth/auth.ts ensureUserSlug
 func ensureUserSlug(ctx context.Context, db *sqldb.Database, userId string) (string, error) {
-	var name, slug string
-	err := db.QueryRow(ctx,
-		`SELECT name, slug FROM "user" WHERE id = $1`, userId,
-	).Scan(&name, &slug)
+	row, err := q().GetUserNameSlug(ctx, userId)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch user: %w", err)
 	}
-	if slug != "" {
-		return slug, nil
+	if row.Slug.Valid && row.Slug.String != "" {
+		return row.Slug.String, nil
 	}
 
-	baseSource := name
+	baseSource := row.Name
 	if baseSource == "" {
 		baseSource = "user"
 	}
 
 	stdlibDB := db.Stdlib()
-	newSlug, err := GenerateUniqueUserSlug(stdlibDB, baseSource, userId)
+	newSlug, err := GenerateUniqueUserSlug(ctx, stdlibDB, baseSource, userId)
 	if err != nil {
 		return "", err
 	}
 
-	_, err = db.Exec(ctx,
-		`UPDATE "user" SET slug = $1 WHERE id = $2`, newSlug, userId,
-	)
+	err = q().UpdateUserSlug(ctx, sqlc.UpdateUserSlugParams{
+		Slug: sql.NullString{String: newSlug, Valid: true},
+		ID:   userId,
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to update user slug: %w", err)
 	}

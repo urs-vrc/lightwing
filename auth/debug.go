@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"encore.app/auth/sqlc"
 )
 
 // Local debug login bypass.
@@ -38,51 +39,48 @@ func ensureDebugUserSession(ctx context.Context) (string, error) {
 	expiresAt := now.Add(sessionLifetime)
 	sessionToken := generateSessionToken()
 
-	tx, err := db.Begin(ctx)
+	stx, err := db.Stdlib().BeginTx(ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer stx.Rollback()
+	qq := q().WithTx(stx)
 
-	var existingID string
-	err = tx.QueryRow(ctx, `SELECT id FROM "user" WHERE id = $1`, debugUserID).Scan(&existingID)
+	_, err = qq.GetUserByID(ctx, debugUserID)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		slug, serr := GenerateUniqueUserSlug(db.Stdlib(), "Debug User", debugUserID)
+		slug, serr := GenerateUniqueUserSlug(ctx, db.Stdlib(), "Debug User", debugUserID)
 		if serr != nil {
 			return "", fmt.Errorf("failed to generate debug user slug: %w", serr)
 		}
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO "user" (id, name, email, image, "siteRole", "vrchatUsername", slug, "createdAt", "updatedAt")
-			 VALUES ($1, 'Debug User', 'debug-user@local.invalid', '', 'SITE_ADMIN', '', $2, $3, $3)`,
-			debugUserID, slug, now); err != nil {
+		if err := qq.InsertDebugUser(ctx, sqlc.InsertDebugUserParams{
+			ID: debugUserID, Slug: nullIfEmpty(slug), CreatedAt: now,
+		}); err != nil {
 			return "", fmt.Errorf("failed to insert debug user: %w", err)
 		}
 	case err != nil:
 		return "", fmt.Errorf("failed to look up debug user: %w", err)
 	}
 
-	var activeOrgID string
-	err = tx.QueryRow(ctx,
-		`SELECT "organizationId" FROM "member" WHERE "userId" = $1 ORDER BY "createdAt" ASC LIMIT 1`,
-		debugUserID,
-	).Scan(&activeOrgID)
+	activeOrgID, err := qq.GetMemberActiveOrg(ctx, debugUserID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", fmt.Errorf("failed to fetch active org: %w", err)
 	}
+	if errors.Is(err, sql.ErrNoRows) {
+		activeOrgID = ""
+	}
 
-	if _, err := tx.Exec(ctx, `DELETE FROM "session" WHERE "userId" = $1`, debugUserID); err != nil {
+	if err := qq.DeleteSessionsByUser(ctx, debugUserID); err != nil {
 		return "", fmt.Errorf("failed to delete old sessions: %w", err)
 	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO "session" (id, "userId", token, "activeOrganizationId", "expiresAt", "createdAt", "updatedAt")
-		 VALUES ($1, $2, $3, $4, $5, $6, $6)`,
-		generateID(), debugUserID, sessionToken,
-		sql.NullString{String: activeOrgID, Valid: activeOrgID != ""},
-		expiresAt, now); err != nil {
+	if err := qq.InsertSession(ctx, sqlc.InsertSessionParams{
+		ID: generateID(), UserId: debugUserID, Token: sessionToken,
+		ActiveOrganizationId: sql.NullString{String: activeOrgID, Valid: activeOrgID != ""},
+		ExpiresAt: expiresAt, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
 		return "", fmt.Errorf("failed to insert session: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := stx.Commit(); err != nil {
 		return "", fmt.Errorf("failed to commit transaction: %w", err)
 	}
 	return sessionToken, nil

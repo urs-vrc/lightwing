@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"encore.dev/beta/errs"
+
+	"encore.app/auth/sqlc"
 )
 
 // TeamAffiliation represents a user's membership in an organization.
@@ -68,22 +70,19 @@ func nullToPtr(ns sql.NullString) *string {
 }
 
 func loadUserRow(ctx context.Context, userID string) (*userRow, error) {
-	var r userRow
-	err := db.QueryRow(ctx,
-		`SELECT id, name, email, image, slug, biography, "careerOverview",
-		        "vrchatUsername", "classTier", "siteRole", "createdAt", "updatedAt"
-		 FROM "user" WHERE id = $1`,
-		userID,
-	).Scan(&r.ID, &r.Name, &r.Email, &r.Image, &r.Slug, &r.Biography,
-		&r.CareerOverview, &r.VrchatUsername, &r.ClassTier, &r.SiteRole,
-		&r.CreatedAt, &r.UpdatedAt)
+	r, err := q().GetUserProfileRow(ctx, userID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "user not found"}
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &r, nil
+	return &userRow{
+		ID: r.ID, Name: r.Name, Email: r.Email, Image: r.Image,
+		Slug: r.Slug, Biography: r.Biography, CareerOverview: r.CareerOverview,
+		VrchatUsername: r.VrchatUsername, ClassTier: nullStringFromAny(r.ClassTier),
+		SiteRole: r.SiteRole, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+	}, nil
 }
 
 func loadTeams(ctx context.Context, userID string) ([]TeamAffiliation, error) {
@@ -102,30 +101,19 @@ func loadTeamsForUsers(ctx context.Context, userIDs []string) (map[string][]Team
 	if len(userIDs) == 0 {
 		return map[string][]TeamAffiliation{}, nil
 	}
-	rows, err := db.Query(ctx,
-		`SELECT m."userId", o.id, o.name, o.slug, m.role
-		 FROM "member" m
-		 JOIN "organization" o ON o.id = m."organizationId"
-		 WHERE m."userId" = ANY($1)
-		 ORDER BY o."createdAt" ASC`,
-		userIDs,
-	)
+	affils, err := q().ListTeamAffiliations(ctx, userIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query team affiliations: %w", err)
 	}
-	defer rows.Close()
 
 	teamsByUser := make(map[string][]TeamAffiliation)
-	for rows.Next() {
-		var userID string
-		var ta TeamAffiliation
-		if err := rows.Scan(&userID, &ta.OrganizationID, &ta.Name, &ta.Slug, &ta.Role); err != nil {
-			return nil, fmt.Errorf("failed to scan team affiliation: %w", err)
-		}
-		teamsByUser[userID] = append(teamsByUser[userID], ta)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate team affiliations: %w", err)
+	for _, a := range affils {
+		teamsByUser[a.UserId] = append(teamsByUser[a.UserId], TeamAffiliation{
+			OrganizationID: a.ID,
+			Name:           a.Name,
+			Slug:           a.Slug,
+			Role:           a.Role,
+		})
 	}
 	return teamsByUser, nil
 }
@@ -177,8 +165,7 @@ func getUserProfile(ctx context.Context, userID string) (*UserProfile, error) {
 //
 // Mirrors ts-legacy/auth/users.ts getUserProfileBySlug
 func getUserProfileBySlug(ctx context.Context, slug string) (*UserProfile, error) {
-	var userID string
-	err := db.QueryRow(ctx, `SELECT id FROM "user" WHERE slug = $1`, slug).Scan(&userID)
+	userID, err := q().GetUserBySlug(ctx, sql.NullString{String: slug, Valid: true})
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "user not found"}
 	}
@@ -214,50 +201,41 @@ func updateUserProfile(ctx context.Context, actor *Actor, targetUserID string, p
 		return nil, err
 	}
 
-	sets := []string{}
-	args := []any{}
-	add := func(column string, value any) {
-		args = append(args, value)
-		sets = append(sets, fmt.Sprintf("%s = $%d", column, len(args)))
-	}
+	up := sqlc.UpdateUserProfileParams{UpdatedAt: time.Now().UTC(), ID: targetUserID}
 
 	if params.Name != nil {
-		add("name", *params.Name)
+		up.Name = sql.NullString{String: *params.Name, Valid: true}
 	}
 	if params.Slug != nil && (existing.Slug.String != *params.Slug || !existing.Slug.Valid) {
 		if !IsValidUserSlug(*params.Slug) {
 			return nil, &errs.Error{Code: errs.InvalidArgument, Message: "invalid slug format or length"}
 		}
-		var collisionID string
-		err := db.QueryRow(ctx, `SELECT id FROM "user" WHERE slug = $1`, *params.Slug).Scan(&collisionID)
+		_, err := q().GetUserBySlug(ctx, sql.NullString{String: *params.Slug, Valid: true})
 		if err == nil {
 			return nil, &errs.Error{Code: errs.AlreadyExists, Message: "user slug is already in use"}
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("failed to check slug collision: %w", err)
 		}
-		add("slug", *params.Slug)
+		up.Slug = sql.NullString{String: *params.Slug, Valid: true}
 	}
 	if params.Image != nil {
-		add("image", nullIfEmpty(*params.Image))
+		up.ImageSet = true
+		up.ImageVal = nullIfEmpty(*params.Image)
 	}
 	if params.Biography != nil {
-		add("biography", nullIfEmpty(*params.Biography))
+		up.BiographySet = true
+		up.BiographyVal = nullIfEmpty(*params.Biography)
 	}
 	if params.CareerOverview != nil {
-		add("careerOverview", nullIfEmpty(*params.CareerOverview))
+		up.CareerSet = true
+		up.CareerVal = nullIfEmpty(*params.CareerOverview)
 	}
 	if params.VrchatUsername != nil {
-		add("vrchatUsername", nullIfEmpty(*params.VrchatUsername))
+		up.VrchatSet = true
+		up.VrchatVal = nullIfEmpty(*params.VrchatUsername)
 	}
-	add("\"updatedAt\"", time.Now().UTC())
-
-	args = append(args, targetUserID)
-	_, err = db.Exec(ctx,
-		fmt.Sprintf(`UPDATE "user" SET %s WHERE id = $%d`, strings.Join(sets, ", "), len(args)),
-		args...,
-	)
-	if err != nil {
+	if err := q().UpdateUserProfile(ctx, up); err != nil {
 		return nil, fmt.Errorf("failed to update user profile: %w", err)
 	}
 	return loadUserProfile(ctx, targetUserID)
@@ -295,11 +273,10 @@ func setUserSiteRole(ctx context.Context, actor *Actor, params *SetUserSiteRoleP
 	if _, err := loadUserRow(ctx, params.UserID); err != nil {
 		return nil, err
 	}
-	_, err := db.Exec(ctx,
-		`UPDATE "user" SET "siteRole" = $1, "updatedAt" = $2 WHERE id = $3`,
-		params.SiteRole, time.Now().UTC(), params.UserID,
-	)
-	if err != nil {
+	if err := q().UpdateUserSiteRole(ctx, sqlc.UpdateUserSiteRoleParams{
+		SiteRole: params.SiteRole,
+		ID:       params.UserID,
+	}); err != nil {
 		return nil, fmt.Errorf("failed to set user site role: %w", err)
 	}
 	return loadUserProfile(ctx, params.UserID)
@@ -335,53 +312,37 @@ func listUsers(ctx context.Context, actor *Actor, q ListUsersQuery) (*ListUsersR
 		return nil, &errs.Error{Code: errs.PermissionDenied, Message: "site admin required"}
 	}
 
-	filter := ""
-	args := []any{}
+	pattern := ""
 	if q.Search != "" {
-		args = append(args, likePattern(q.Search))
-		filter = `WHERE name ILIKE $1 ESCAPE '\' OR "vrchatUsername" ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\' OR slug ILIKE $1 ESCAPE '\'`
+		pattern = likePattern(q.Search)
 	}
 
-	var total int
-	if err := db.QueryRow(ctx,
-		fmt.Sprintf(`SELECT COUNT(*) FROM "user" %s`, filter), args...,
-	).Scan(&total); err != nil {
+	total64, err := sqlc.New(db.Stdlib()).CountUsersBySearch(ctx, pattern)
+	if err != nil {
 		return nil, fmt.Errorf("failed to count users: %w", err)
 	}
+	total := int(total64)
 
-	query := fmt.Sprintf(
-		`SELECT id, name, email, image, slug, biography, "careerOverview",
-		        "vrchatUsername", "classTier", "siteRole", "createdAt", "updatedAt"
-		 FROM "user" %s ORDER BY "createdAt" ASC`, filter)
-	if q.Limit > 0 {
-		args = append(args, q.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-	}
-	if q.Offset > 0 {
-		args = append(args, q.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-	}
-
-	rows, err := db.Query(ctx, query, args...)
+	urows, err := sqlc.New(db.Stdlib()).ListUserRows(ctx, sqlc.ListUserRowsParams{
+		Column1: pattern,
+		Column2: int32(q.Limit),
+		Column3: int32(q.Offset),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to query users: %w", err)
 	}
-	defer rows.Close()
 
 	userRows := []userRow{}
 	userIDs := []string{}
-	for rows.Next() {
-		var r userRow
-		if err := rows.Scan(&r.ID, &r.Name, &r.Email, &r.Image, &r.Slug,
-			&r.Biography, &r.CareerOverview, &r.VrchatUsername, &r.ClassTier,
-			&r.SiteRole, &r.CreatedAt, &r.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("failed to scan user: %w", err)
+	for _, ur := range urows {
+		r := userRow{
+			ID: ur.ID, Name: ur.Name, Email: ur.Email, Image: ur.Image,
+			Slug: ur.Slug, Biography: ur.Biography, CareerOverview: ur.CareerOverview,
+			VrchatUsername: ur.VrchatUsername, ClassTier: nullStringFromAny(ur.ClassTier),
+			SiteRole: ur.SiteRole, CreatedAt: ur.CreatedAt, UpdatedAt: ur.UpdatedAt,
 		}
 		userRows = append(userRows, r)
 		userIDs = append(userIDs, r.ID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate users: %w", err)
 	}
 
 	teamsByUser, err := loadTeamsForUsers(ctx, userIDs)

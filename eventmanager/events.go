@@ -5,13 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 
 	"encore.dev/beta/errs"
-	"encore.dev/storage/sqldb"
 	"encore.app/auth"
+	"encore.app/eventmanager/sqlc"
 	"encore.app/shared"
+
+	"github.com/sqlc-dev/pqtype"
 )
 
 // Scoring types, mirroring ts-legacy/lib/constants.ts.
@@ -237,20 +238,26 @@ type eventRow struct {
 	UpdatedAt                       time.Time
 }
 
-const eventColumns = `id, name, description, "ownerType", "organizationId", "ownerUserId", status, tag, "deletedAt", "scoringType", "scoringRulesMode", "customScoringTables", "classRestriction", "granularParticipation", "signupsLocked", "scheduledAt", "participantLimit", "maxConcurrentRaceParticipations", "createdAt", "updatedAt"`
-
-func scanEventRow(row *sqldb.Row) (*eventRow, error) {
-	var e eventRow
-	err := row.Scan(
-		&e.ID, &e.Name, &e.Description, &e.OwnerType, &e.OrganizationID, &e.OwnerUserID,
-		&e.Status, &e.Tag, &e.DeletedAt, &e.ScoringType, &e.ScoringRulesMode, &e.CustomScoringTables,
-		&e.ClassRestriction, &e.GranularParticipation, &e.SignupsLocked, &e.ScheduledAt,
-		&e.ParticipantLimit, &e.MaxConcurrentRaceParticipations, &e.CreatedAt, &e.UpdatedAt,
-	)
-	if err != nil {
-		return nil, err
+// toEventRow maps a sqlc event row onto the local eventRow.
+func toEventRow(r sqlc.GetEventRowRow) *eventRow {
+	var customTables []byte
+	if r.CustomScoringTables.Valid {
+		customTables = r.CustomScoringTables.RawMessage
 	}
-	return &e, nil
+	return &eventRow{
+		ID: r.ID, Name: r.Name, Description: r.Description,
+		OwnerType: stringFromAny(r.OwnerType),
+		OrganizationID: r.OrganizationId, OwnerUserID: r.OwnerUserId,
+		Status: r.Status, Tag: r.Tag, DeletedAt: timePtrFromNull(r.DeletedAt),
+		ScoringType: int(r.ScoringType), ScoringRulesMode: r.ScoringRulesMode,
+		CustomScoringTables: customTables,
+		ClassRestriction: nullStringFromAny(r.ClassRestriction),
+		GranularParticipation: r.GranularParticipation, SignupsLocked: r.SignupsLocked,
+		ScheduledAt: timePtrFromNull(r.ScheduledAt),
+		ParticipantLimit: sql.NullInt64{Int64: int64(r.ParticipantLimit.Int32), Valid: r.ParticipantLimit.Valid},
+		MaxConcurrentRaceParticipations: sql.NullInt64{Int64: int64(r.MaxConcurrentRaceParticipations.Int32), Valid: r.MaxConcurrentRaceParticipations.Valid},
+		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+	}
 }
 
 // LoadEvent returns a single event with members, schedules and the scoring
@@ -258,11 +265,7 @@ func scanEventRow(row *sqldb.Row) (*eventRow, error) {
 //
 // Mirrors ts-legacy/eventmanager/events.ts loadEvent.
 func LoadEvent(ctx context.Context, id string) (*EventDetail, error) {
-	e, err := scanEventRow(db.QueryRow(ctx,
-		`SELECT `+eventColumns+` FROM "event" WHERE id = $1`, id))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, &errs.Error{Code: errs.NotFound, Message: "event not found"}
-	}
+	e, err := requireEventRow(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -283,53 +286,35 @@ func LoadEvent(ctx context.Context, id string) (*EventDetail, error) {
 		ParticipantLimit sql.NullInt64
 	}
 	var races []raceRow
-	rows, err := db.Query(ctx,
-		`SELECT id, name, sequence, "distanceMeters", "trackType", location, "scoringType", grade, "classRestriction", "startsAt", "endsAt", "participantLimit"
-		 FROM "race_event" WHERE "eventId" = $1 ORDER BY sequence ASC`, id)
+	rrows, err := q().ListEventRaces(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var r raceRow
-		if err := rows.Scan(&r.ID, &r.Name, &r.Sequence, &r.DistanceMeters, &r.TrackType,
-			&r.Location, &r.ScoringType, &r.Grade, &r.ClassRestriction, &r.StartsAt, &r.EndsAt,
-			&r.ParticipantLimit); err != nil {
-			return nil, err
-		}
-		races = append(races, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	for _, rr := range rrows {
+		races = append(races, raceRow{
+			ID: rr.ID, Name: rr.Name, Sequence: int(rr.Sequence),
+			DistanceMeters: int(rr.DistanceMeters), TrackType: rr.TrackType, Location: rr.Location,
+			ScoringType: sql.NullInt64{Int64: int64(rr.ScoringType.Int16), Valid: rr.ScoringType.Valid},
+			Grade: rr.Grade, ClassRestriction: nullStringFromAny(rr.ClassRestriction),
+			StartsAt: timePtrFromNull(rr.StartsAt), EndsAt: timePtrFromNull(rr.EndsAt),
+			ParticipantLimit: sql.NullInt64{Int64: int64(rr.ParticipantLimit.Int32), Valid: rr.ParticipantLimit.Valid},
+		})
 	}
 
 	// Race members with display names, grouped by race.
 	raceMembers := map[string][]RaceEventMemberView{}
 	activeUserIDs := map[string]bool{}
 	if len(races) > 0 {
-		mrows, err := db.Query(ctx,
-			`SELECT m."raceEventId", m."userId", COALESCE(u."vrchatUsername", u.name), u."classTier"
-			 FROM "race_event_member" m
-			 JOIN "race_event" r ON r.id = m."raceEventId"
-			 JOIN "user" u ON u.id = m."userId"
-			 WHERE r."eventId" = $1`, id)
+		mrows, err := q().ListRaceMembersByEvent(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		defer mrows.Close()
-		for mrows.Next() {
-			var raceID, userID, name string
-			var tier sql.NullString
-			if err := mrows.Scan(&raceID, &userID, &name, &tier); err != nil {
-				return nil, err
-			}
-			raceMembers[raceID] = append(raceMembers[raceID], RaceEventMemberView{
-				UserID: userID, Name: name, ClassTier: classTierPtr(tier),
+		for _, m := range mrows {
+			tier := nullStringFromAny(m.ClassTier)
+			raceMembers[m.RaceEventId] = append(raceMembers[m.RaceEventId], RaceEventMemberView{
+				UserID: m.UserId, Name: m.VrchatUsername, ClassTier: classTierPtr(tier),
 			})
-			activeUserIDs[userID] = true
-		}
-		if err := mrows.Err(); err != nil {
-			return nil, err
+			activeUserIDs[m.UserId] = true
 		}
 	}
 
@@ -340,54 +325,29 @@ func LoadEvent(ctx context.Context, id string) (*EventDetail, error) {
 		Tier   sql.NullString
 	}
 	var members []memberRow
-	erows, err := db.Query(ctx,
-		`SELECT m."userId", COALESCE(u."vrchatUsername", u.name), u."classTier"
-		 FROM "event_member" m JOIN "user" u ON u.id = m."userId"
-		 WHERE m."eventId" = $1`, id)
+	emrows, err := q().ListEventMembersByEvent(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	defer erows.Close()
-	for erows.Next() {
-		var m memberRow
-		if err := erows.Scan(&m.UserID, &m.Name, &m.Tier); err != nil {
-			return nil, err
-		}
+	for _, em := range emrows {
+		m := memberRow{UserID: em.UserId, Name: em.VrchatUsername, Tier: nullStringFromAny(em.ClassTier)}
 		if e.GranularParticipation && !activeUserIDs[m.UserID] {
 			continue
 		}
 		members = append(members, m)
 	}
-	if err := erows.Err(); err != nil {
-		return nil, err
-	}
 
 	// Schedules.
 	var schedules []EventScheduleView
-	srows, err := db.Query(ctx,
-		`SELECT id, title, "startsAt", "endsAt", location FROM "event_schedule"
-		 WHERE "eventId" = $1 ORDER BY "startsAt" ASC`, id)
+	srows, err := q().ListEventSchedules(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	defer srows.Close()
-	for srows.Next() {
-		var s EventScheduleView
-		var title sql.NullString
-		var startsAt time.Time
-		var endsAt *time.Time
-		var location sql.NullString
-		if err := srows.Scan(&s.ID, &title, &startsAt, &endsAt, &location); err != nil {
-			return nil, err
-		}
-		s.Title = nullString(title)
-		s.StartsAt = isoTime(startsAt)
-		s.EndsAt = nullTime(endsAt)
-		s.Location = nullString(location)
-		schedules = append(schedules, s)
-	}
-	if err := srows.Err(); err != nil {
-		return nil, err
+	for _, sr := range srows {
+		schedules = append(schedules, EventScheduleView{
+			ID: sr.ID, Title: nullString(sr.Title), StartsAt: isoTime(sr.StartsAt),
+			EndsAt: nullTime(timePtrFromNull(sr.EndsAt)), Location: nullString(sr.Location),
+		})
 	}
 
 	// Scoring overviews matching the event's scoring type (the other stays null).
@@ -395,46 +355,28 @@ func LoadEvent(ctx context.Context, id string) (*EventDetail, error) {
 	var ladderOverview []LadderEntryView
 	if e.ScoringType == ScoringPoints {
 		pointsOverview = []PointsEntryView{}
-		prows, err := db.Query(ctx,
-			`SELECT e."userId", COALESCE(u."vrchatUsername", u.name), e.points
-			 FROM "event_points_entry" e JOIN "user" u ON u.id = e."userId"
-			 WHERE e."eventId" = $1 ORDER BY e.points DESC`, id)
+		prows, err := q().ListPointsOverview(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		defer prows.Close()
-		for prows.Next() {
-			var p PointsEntryView
-			if err := prows.Scan(&p.UserID, &p.Name, &p.Points); err != nil {
-				return nil, err
-			}
-			pointsOverview = append(pointsOverview, p)
-		}
-		if err := prows.Err(); err != nil {
-			return nil, err
+		for _, pr := range prows {
+			pointsOverview = append(pointsOverview, PointsEntryView{
+				UserID: pr.UserId, Name: pr.VrchatUsername, Points: int(pr.Points),
+			})
 		}
 	} else if e.ScoringType == ScoringLadder {
 		ladderOverview = []LadderEntryView{}
-		lrows, err := db.Query(ctx,
-			`SELECT e."userId", COALESCE(u."vrchatUsername", u.name), e.elo, e.wins, e.losses
-			 FROM "event_ladder_entry" e JOIN "user" u ON u.id = e."userId"
-			 WHERE e."eventId" = $1 ORDER BY e.elo DESC`, id)
+		lrows, err := q().ListLadderOverview(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		defer lrows.Close()
 		rank := 0
-		for lrows.Next() {
-			var l LadderEntryView
-			if err := lrows.Scan(&l.UserID, &l.Name, &l.Elo, &l.Wins, &l.Losses); err != nil {
-				return nil, err
-			}
+		for _, lr := range lrows {
 			rank++
-			l.Rank = rank
-			ladderOverview = append(ladderOverview, l)
-		}
-		if err := lrows.Err(); err != nil {
-			return nil, err
+			ladderOverview = append(ladderOverview, LadderEntryView{
+				UserID: lr.UserId, Name: lr.VrchatUsername,
+				Elo: int(lr.Elo), Wins: int(lr.Wins), Losses: int(lr.Losses), Rank: rank,
+			})
 		}
 	}
 
@@ -492,18 +434,15 @@ func LoadEvent(ctx context.Context, id string) (*EventDetail, error) {
 //
 // Mirrors ts-legacy/eventmanager/events.ts ensureEventStandingsRow.
 func EnsureEventStandingsRow(ctx context.Context, eventID, userID string, scoringType int) error {
+	now := time.Now().UTC()
 	if scoringType == ScoringPoints {
-		_, err := db.Exec(ctx,
-			`INSERT INTO "event_points_entry" (id, "eventId", "userId", points, "createdAt", "updatedAt")
-			 VALUES ($1, $2, $3, 0, $4, $4) ON CONFLICT ("eventId", "userId") DO NOTHING`,
-			newID(), eventID, userID, time.Now().UTC())
-		return err
+		return q().InsertPointsStandingsRow(ctx, sqlc.InsertPointsStandingsRowParams{
+			ID: newID(), EventId: eventID, UserId: userID, CreatedAt: now,
+		})
 	}
-	_, err := db.Exec(ctx,
-		`INSERT INTO "event_ladder_entry" (id, "eventId", "userId", elo, "createdAt", "updatedAt")
-		 VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT ("eventId", "userId") DO NOTHING`,
-		newID(), eventID, userID, LadderStartingElo, time.Now().UTC())
-	return err
+	return q().InsertLadderStandingsRow(ctx, sqlc.InsertLadderStandingsRowParams{
+		ID: newID(), EventId: eventID, UserId: userID, Elo: int32(LadderStartingElo), CreatedAt: now,
+	})
 }
 
 // --- Create ---
@@ -546,13 +485,11 @@ func CreateEventCore(ctx context.Context, p *CreateEventRequest) (*EventDetail, 
 		if _, _, err := auth.RequirePermission(ctx, p.Authorization, *p.OrganizationID, auth.ResourceEvent, auth.ActionCreate); err != nil {
 			return nil, err
 		}
-		var exists bool
-		if err := db.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM "organization" WHERE id = $1)`, *p.OrganizationID,
-		).Scan(&exists); err != nil {
+		orgExists, err := q().OrgExists(ctx, *p.OrganizationID)
+		if err != nil {
 			return nil, err
 		}
-		if !exists {
+		if !orgExists {
 			return nil, &errs.Error{Code: errs.NotFound, Message: "organization not found"}
 		}
 		organizationID = p.OrganizationID
@@ -568,13 +505,11 @@ func CreateEventCore(ctx context.Context, p *CreateEventRequest) (*EventDetail, 
 		if owner != actor.UserID && !auth.IsSiteAdmin(actor.SiteRole) {
 			return nil, &errs.Error{Code: errs.PermissionDenied, Message: "only a site administrator can create an event on behalf of another user"}
 		}
-		var exists bool
-		if err := db.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM "user" WHERE id = $1)`, owner,
-		).Scan(&exists); err != nil {
+		ownerExists, err := q().UserExists(ctx, owner)
+		if err != nil {
 			return nil, err
 		}
-		if !exists {
+		if !ownerExists {
 			return nil, &errs.Error{Code: errs.NotFound, Message: "owner user not found"}
 		}
 		ownerUserID = &owner
@@ -669,17 +604,33 @@ func CreateEventCore(ctx context.Context, p *CreateEventRequest) (*EventDetail, 
 
 	now := time.Now().UTC()
 	id := newID()
-	_, err := db.Exec(ctx,
-		`INSERT INTO "event" (id, name, description, "ownerType", "organizationId", "ownerUserId",
-		  status, tag, "scoringType", "scoringRulesMode", "customScoringTables", "classRestriction",
-		  "granularParticipation", "scheduledAt", "participantLimit", "maxConcurrentRaceParticipations",
-		  "createdAt", "updatedAt")
-		 VALUES ($1,$2,$3,$4,$5,$6,'DRAFT',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16)`,
-		id, truncate(p.Name, 255), description, p.OwnerType, organizationID, ownerUserID,
-		tag, p.ScoringType, scoringRulesMode, customTablesJSON, classRestriction,
-		isGranular, scheduledAt, participantLimit, maxConcurrent,
-		now)
-	if err != nil {
+	var customTablesParam pqtype.NullRawMessage
+	if customTablesJSON != nil {
+		if s, ok := customTablesJSON.(string); ok {
+			customTablesParam = pqtype.NullRawMessage{RawMessage: []byte(s), Valid: true}
+		}
+	}
+	var classRestr any
+	if classRestriction != nil {
+		classRestr = *classRestriction
+	}
+	var participantLimitNull, maxConcurrentNull sql.NullInt32
+	if participantLimit != nil {
+		participantLimitNull = sql.NullInt32{Int32: int32(*participantLimit), Valid: true}
+	}
+	if maxConcurrent != nil {
+		maxConcurrentNull = sql.NullInt32{Int32: int32(*maxConcurrent), Valid: true}
+	}
+	if err := q().CreateEvent(ctx, sqlc.CreateEventParams{
+		ID: id, Name: truncate(p.Name, 255), Description: nullStringFromPtr(description),
+		OwnerType: p.OwnerType, OrganizationId: nullStringFromPtr(organizationID),
+		OwnerUserId: nullStringFromPtr(ownerUserID), Tag: tag,
+		ScoringType: int16(p.ScoringType), ScoringRulesMode: nullStringFromPtr(scoringRulesMode),
+		CustomScoringTables: customTablesParam, ClassRestriction: classRestr,
+		GranularParticipation: isGranular, ScheduledAt: nullTimeFromPtr(scheduledAt),
+		ParticipantLimit: participantLimitNull, MaxConcurrentRaceParticipations: maxConcurrentNull,
+		CreatedAt: now,
+	}); err != nil {
 		return nil, err
 	}
 	return LoadEvent(ctx, id)
@@ -696,8 +647,7 @@ func CreateEvent(ctx context.Context, p *CreateEventRequest) (*EventDetail, erro
 // that were deleted more than 7 days ago.
 func PurgeExpiredDeletedEvents(ctx context.Context) error {
 	threshold := time.Now().UTC().AddDate(0, 0, -7)
-	_, err := db.Exec(ctx, `DELETE FROM "event" WHERE status = 'PENDING_DELETION' AND "deletedAt" <= $1`, threshold)
-	return err
+	return q().PurgeExpiredDeletedEvents(ctx, sql.NullTime{Time: threshold, Valid: true})
 }
 
 // ListEventsQuery carries optional filters plus pagination.
@@ -719,99 +669,71 @@ type ListEventsResponse struct {
 	Total  int             `json:"total"`
 }
 
-func scanListItem(scan func(...any) error) (EventListItem, error) {
-	var item EventListItem
-	var description, orgID, ownerUID, classRestriction sql.NullString
-	var deletedTime, schedTime *time.Time
-	var participantLimit, maxConcurrent sql.NullInt64
-	var createdAt, updatedAt time.Time
-	var raceCount, memberCount int64
-	err := scan(&item.ID, &item.Name, &description, &item.OwnerType, &orgID, &ownerUID,
-		&item.Status, &item.Tag, &deletedTime, &item.ScoringType, &classRestriction, &item.GranularParticipation,
-		&item.SignupsLocked, &schedTime, &participantLimit, &maxConcurrent,
-		&createdAt, &updatedAt, &raceCount, &memberCount)
-	if err != nil {
-		return item, err
+// toListItem maps a sqlc list row onto the public EventListItem.
+func toListItem(r sqlc.ListEventsRow) EventListItem {
+	return EventListItem{
+		ID: r.ID, Name: r.Name, Description: nullString(r.Description),
+		OwnerType: stringFromAny(r.OwnerType),
+		OrganizationID: nullString(r.OrganizationId),
+		OwnerUserID: nullString(r.OwnerUserId),
+		Status: r.Status, Tag: r.Tag, DeletedAt: nullTime(timePtrFromNull(r.DeletedAt)),
+		ScoringType: int(r.ScoringType), ScoringTypeLabel: scoringLabel(int(r.ScoringType)),
+		ClassRestriction: classTierPtr(nullStringFromAny(r.ClassRestriction)),
+		GranularParticipation: r.GranularParticipation, SignupsLocked: r.SignupsLocked,
+		ScheduledAt: nullTime(timePtrFromNull(r.ScheduledAt)),
+		ParticipantLimit: nullInt(sql.NullInt64{Int64: int64(r.ParticipantLimit.Int32), Valid: r.ParticipantLimit.Valid}),
+		MaxConcurrentRaceParticipations: nullInt(sql.NullInt64{Int64: int64(r.MaxConcurrentRaceParticipations.Int32), Valid: r.MaxConcurrentRaceParticipations.Valid}),
+		RaceCount: int(r.Count), MemberCount: int(r.Count_2),
+		CreatedAt: isoTime(r.CreatedAt), UpdatedAt: isoTime(r.UpdatedAt),
 	}
-	item.Description = nullString(description)
-	item.OrganizationID = nullString(orgID)
-	item.OwnerUserID = nullString(ownerUID)
-	item.DeletedAt = nullTime(deletedTime)
-	item.ScoringTypeLabel = scoringLabel(item.ScoringType)
-	item.ClassRestriction = classTierPtr(classRestriction)
-	item.ScheduledAt = nullTime(schedTime)
-	item.ParticipantLimit = nullInt(participantLimit)
-	item.MaxConcurrentRaceParticipations = nullInt(maxConcurrent)
-	item.RaceCount = int(raceCount)
-	item.MemberCount = int(memberCount)
-	item.CreatedAt = isoTime(createdAt)
-	item.UpdatedAt = isoTime(updatedAt)
-	return item, nil
 }
 
-const listItemSelect = `e.id, e.name, e.description, e."ownerType", e."organizationId", e."ownerUserId",
-	e.status, e.tag, e."deletedAt", e."scoringType", e."classRestriction", e."granularParticipation",
-	e."signupsLocked", e."scheduledAt", e."participantLimit", e."maxConcurrentRaceParticipations",
-	e."createdAt", e."updatedAt",
-	(SELECT COUNT(*) FROM "race_event" r WHERE r."eventId" = e.id),
-	(SELECT COUNT(*) FROM "event_member" m WHERE m."eventId" = e.id)`
+// toPublicListItem adapts a public-listing row (identical columns) to the
+// shared list-row shape.
+func toPublicListItem(r sqlc.ListPublicEventsRow) sqlc.ListEventsRow {
+	return sqlc.ListEventsRow{
+		ID: r.ID, Name: r.Name, Description: r.Description, OwnerType: r.OwnerType,
+		OrganizationId: r.OrganizationId, OwnerUserId: r.OwnerUserId,
+		Status: r.Status, Tag: r.Tag, DeletedAt: r.DeletedAt,
+		ScoringType: r.ScoringType, ClassRestriction: r.ClassRestriction,
+		GranularParticipation: r.GranularParticipation, SignupsLocked: r.SignupsLocked,
+		ScheduledAt: r.ScheduledAt, ParticipantLimit: r.ParticipantLimit,
+		MaxConcurrentRaceParticipations: r.MaxConcurrentRaceParticipations,
+		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		Count: r.Count, Count_2: r.Count_2,
+	}
+}
 
 // ListEventsCore lists events with optional filters.
 func ListEventsCore(ctx context.Context, q *ListEventsQuery) (*ListEventsResponse, error) {
 	_ = PurgeExpiredDeletedEvents(ctx)
 
-	where := ""
-	args := []any{}
-	if q.OrganizationID != "" {
-		args = append(args, q.OrganizationID)
-		where += fmt.Sprintf(" AND e.\"organizationId\" = $%d", len(args))
-	}
-	if q.ClassRestriction != "" {
-		args = append(args, q.ClassRestriction)
-		where += fmt.Sprintf(" AND e.\"classRestriction\" = $%d", len(args))
-	}
-	if q.Tag != "" {
-		args = append(args, q.Tag)
-		where += fmt.Sprintf(" AND e.tag = $%d", len(args))
-	}
-	if q.Status != "" {
-		args = append(args, q.Status)
-		where += fmt.Sprintf(" AND e.status = $%d", len(args))
-	} else if !q.IncludeDeleted {
-		where += " AND e.status != 'PENDING_DELETION'"
-	}
-
-	var total int64
-	if err := db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM "event" e WHERE TRUE`+where, args...,
-	).Scan(&total); err != nil {
-		return nil, err
-	}
-
-	query := `SELECT ` + listItemSelect + ` FROM "event" e WHERE TRUE` + where + ` ORDER BY e."createdAt" DESC`
-	if q.Limit > 0 {
-		args = append(args, q.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-	}
-	if q.Offset > 0 {
-		args = append(args, q.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-	}
-	rows, err := db.Query(ctx, query, args...)
+	qq := sqlc.New(std())
+	total, err := qq.CountEvents(ctx, sqlc.CountEventsParams{
+		Column1: q.OrganizationID,
+		Column2: q.ClassRestriction,
+		Column3: q.Tag,
+		Column4: q.Status,
+		Column5: q.IncludeDeleted,
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	items := []EventListItem{}
-	for rows.Next() {
-		item, err := scanListItem(rows.Scan)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
+	rows, err := qq.ListEvents(ctx, sqlc.ListEventsParams{
+		Column1: q.OrganizationID,
+		Column2: q.ClassRestriction,
+		Column3: q.Tag,
+		Column4: q.Status,
+		Column5: q.IncludeDeleted,
+		Column6: int32(q.Limit),
+		Column7: int32(q.Offset),
+	})
+	if err != nil {
 		return nil, err
+	}
+	items := []EventListItem{}
+	for _, r := range rows {
+		items = append(items, toListItem(r))
 	}
 	return &ListEventsResponse{Events: items, Total: int(total)}, nil
 }
@@ -836,30 +758,21 @@ func ListPublicEventsCore(ctx context.Context, q *ListPublicEventsQuery) (*ListE
 	if limit == 0 {
 		limit = 10
 	}
-	var total int64
-	if err := db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM "event" e WHERE e.status IN ('PENDING','ONGOING','CONCLUDED')`,
-	).Scan(&total); err != nil {
-		return nil, err
-	}
-	rows, err := db.Query(ctx,
-		`SELECT `+listItemSelect+` FROM "event" e
-		 WHERE e.status IN ('PENDING','ONGOING','CONCLUDED')
-		 ORDER BY e."createdAt" DESC LIMIT $1 OFFSET $2`, limit, q.Offset)
+	qq := sqlc.New(std())
+	total, err := qq.CountPublicEvents(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	items := []EventListItem{}
-	for rows.Next() {
-		item, err := scanListItem(rows.Scan)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
+	rows, err := qq.ListPublicEvents(ctx, sqlc.ListPublicEventsParams{
+		Column1: int32(limit),
+		Column2: int32(q.Offset),
+	})
+	if err != nil {
 		return nil, err
+	}
+	items := []EventListItem{}
+	for _, r := range rows {
+		items = append(items, toListItem(toPublicListItem(r)))
 	}
 	return &ListEventsResponse{Events: items, Total: int(total)}, nil
 }
@@ -893,24 +806,13 @@ type ListEventAdminsResponse struct {
 //
 // Mirrors ts-legacy/eventmanager/events.ts listEventAdmins.
 func ListEventAdminsCore(ctx context.Context, eventID string) (*ListEventAdminsResponse, error) {
-	rows, err := db.Query(ctx,
-		`SELECT a."userId", COALESCE(u."vrchatUsername", u.name)
-		 FROM "event_admin" a JOIN "user" u ON u.id = a."userId"
-		 WHERE a."eventId" = $1`, eventID)
+	rows, err := q().ListEventAdmins(ctx, eventID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	admins := []EventAdminView{}
-	for rows.Next() {
-		var a EventAdminView
-		if err := rows.Scan(&a.UserID, &a.Name); err != nil {
-			return nil, err
-		}
-		admins = append(admins, a)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	for _, r := range rows {
+		admins = append(admins, EventAdminView{UserID: r.UserId, Name: r.VrchatUsername})
 	}
 	return &ListEventAdminsResponse{Admins: admins}, nil
 }
@@ -941,21 +843,17 @@ func AddEventAdminCore(ctx context.Context, p *AddEventAdminRequest) (*AddEventA
 	if _, err := auth.RequireEventPermission(ctx, p.Authorization, p.EventID, auth.ActionUpdate); err != nil {
 		return nil, err
 	}
-	var exists bool
-	if err := db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM "user" WHERE id = $1)`, p.UserID,
-	).Scan(&exists); err != nil {
+	userExists, err := q().UserExists(ctx, p.UserID)
+	if err != nil {
 		return nil, err
 	}
-	if !exists {
+	if !userExists {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "user not found"}
 	}
 	// Idempotent: ignore duplicate admin rows.
-	_, err := db.Exec(ctx,
-		`INSERT INTO "event_admin" (id, "eventId", "userId", "createdAt")
-		 VALUES ($1, $2, $3, $4) ON CONFLICT ("eventId", "userId") DO NOTHING`,
-		newID(), p.EventID, p.UserID, time.Now().UTC())
-	if err != nil {
+	if err := q().InsertEventAdmin(ctx, sqlc.InsertEventAdminParams{
+		ID: newID(), EventId: p.EventID, UserId: p.UserID, CreatedAt: time.Now().UTC(),
+	}); err != nil {
 		return nil, err
 	}
 	return &AddEventAdminResponse{Success: true}, nil
@@ -981,9 +879,10 @@ func RemoveEventAdminCore(ctx context.Context, p *RemoveEventAdminRequest) (*Add
 	if _, err := auth.RequireEventPermission(ctx, p.Authorization, p.EventID, auth.ActionUpdate); err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(ctx,
-		`DELETE FROM "event_admin" WHERE "eventId" = $1 AND "userId" = $2`,
-		p.EventID, p.UserID); err != nil {
+	if err := q().DeleteEventAdmin(ctx, sqlc.DeleteEventAdminParams{
+		EventId: p.EventID,
+		UserId:  p.UserID,
+	}); err != nil {
 		return nil, err
 	}
 	return &AddEventAdminResponse{Success: true}, nil
@@ -1011,10 +910,7 @@ type DeleteEventResponse struct {
 
 // DeleteEventCore soft-deletes an event (putting it into PENDING_DELETION) or permanently deletes it if specified/already pending.
 func DeleteEventCore(ctx context.Context, p *DeleteEventRequest) (*DeleteEventResponse, error) {
-	var status string
-	err := db.QueryRow(ctx,
-		`SELECT status FROM "event" WHERE id = $1`, p.ID,
-	).Scan(&status)
+	status, err := q().GetEventStatus(ctx, p.ID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "event not found"}
 	}
@@ -1025,12 +921,14 @@ func DeleteEventCore(ctx context.Context, p *DeleteEventRequest) (*DeleteEventRe
 		return nil, err
 	}
 	if p.Permanent || status == "PENDING_DELETION" {
-		if _, err := db.Exec(ctx, `DELETE FROM "event" WHERE id = $1`, p.ID); err != nil {
+		if err := q().DeleteEventByID(ctx, p.ID); err != nil {
 			return nil, err
 		}
 	} else {
 		now := time.Now().UTC()
-		if _, err := db.Exec(ctx, `UPDATE "event" SET status = 'PENDING_DELETION', "deletedAt" = $1 WHERE id = $2`, now, p.ID); err != nil {
+		if err := q().SoftDeleteEvent(ctx, sqlc.SoftDeleteEventParams{
+			DeletedAt: sql.NullTime{Time: now, Valid: true}, ID: p.ID,
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -1050,8 +948,8 @@ type RestoreEventRequest struct {
 
 // RestoreEventCore restores a soft-deleted event back to PENDING.
 func RestoreEventCore(ctx context.Context, p *RestoreEventRequest) (*EventDetail, error) {
-	var exists bool
-	if err := db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM "event" WHERE id = $1)`, p.ID).Scan(&exists); err != nil {
+	exists, err := q().EventExists(ctx, p.ID)
+	if err != nil {
 		return nil, err
 	}
 	if !exists {
@@ -1060,7 +958,7 @@ func RestoreEventCore(ctx context.Context, p *RestoreEventRequest) (*EventDetail
 	if _, err := auth.RequireEventPermission(ctx, p.Authorization, p.ID, auth.ActionUpdate); err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(ctx, `UPDATE "event" SET status = 'PENDING', "deletedAt" = NULL WHERE id = $1`, p.ID); err != nil {
+	if err := q().RestoreEventStatus(ctx, p.ID); err != nil {
 		return nil, err
 	}
 	return LoadEvent(ctx, p.ID)

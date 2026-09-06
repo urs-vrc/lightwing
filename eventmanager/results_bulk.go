@@ -7,6 +7,7 @@ import (
 
 	"encore.dev/beta/errs"
 	"encore.app/auth"
+	"encore.app/eventmanager/sqlc"
 )
 
 // Bulk standings endpoints: full-replace (PUT) and additive merge (POST).
@@ -78,8 +79,10 @@ func ReplaceRaceResultsCore(ctx context.Context, p *BulkResultsRequest) (*RaceRe
 		return nil, err
 	}
 	if len(removed) > 0 {
-		if _, err := db.Exec(ctx,
-			`DELETE FROM "race_result" WHERE "raceEventId"=$1 AND "userId"=ANY($2)`, p.RaceID, removed); err != nil {
+		if err := q().DeleteAbsentRaceResults(ctx, sqlc.DeleteAbsentRaceResultsParams{
+			RaceEventId: p.RaceID,
+			Column2:     removed,
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -168,23 +171,17 @@ func scoringRulesOf(e *eventRow) (string, any) {
 
 // removedResultUsers returns existing result holders absent from the payload.
 func removedResultUsers(ctx context.Context, raceID string, payloadIDs map[string]bool) ([]string, error) {
-	rows, err := db.Query(ctx,
-		`SELECT "userId" FROM "race_result" WHERE "raceEventId"=$1`, raceID)
+	holders, err := q().ListResultUserIDs(ctx, raceID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var removed []string
-	for rows.Next() {
-		var uid string
-		if err := rows.Scan(&uid); err != nil {
-			return nil, err
-		}
+	for _, uid := range holders {
 		if !payloadIDs[uid] {
 			removed = append(removed, uid)
 		}
 	}
-	return removed, rows.Err()
+	return removed, nil
 }
 
 func keysOf(m map[string]bool) []string {

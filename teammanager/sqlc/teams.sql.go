@@ -8,7 +8,51 @@ package sqlc
 import (
 	"context"
 	"database/sql"
+
+	"github.com/lib/pq"
 )
+
+const batchCountMembersAndAdmins = `-- name: BatchCountMembersAndAdmins :many
+SELECT "organizationId", COUNT(*), COUNT(*) FILTER (WHERE role = $1)
+FROM "member"
+WHERE "organizationId" = ANY($2::text[])
+GROUP BY "organizationId"
+`
+
+type BatchCountMembersAndAdminsParams struct {
+	Role    string
+	Column2 []string
+}
+
+type BatchCountMembersAndAdminsRow struct {
+	OrganizationId string
+	Count          int64
+	Count_2        int64
+}
+
+// Batch member/admin counts for a page of orgs (used by listTeams).
+func (q *Queries) BatchCountMembersAndAdmins(ctx context.Context, arg BatchCountMembersAndAdminsParams) ([]BatchCountMembersAndAdminsRow, error) {
+	rows, err := q.db.QueryContext(ctx, batchCountMembersAndAdmins, arg.Role, pq.Array(arg.Column2))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []BatchCountMembersAndAdminsRow
+	for rows.Next() {
+		var i BatchCountMembersAndAdminsRow
+		if err := rows.Scan(&i.OrganizationId, &i.Count, &i.Count_2); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
 
 const countAdmins = `-- name: CountAdmins :one
 SELECT COUNT(*) FROM "member" WHERE "organizationId" = $1 AND role = $2
@@ -558,6 +602,68 @@ type UpdateMemberRoleParams struct {
 
 func (q *Queries) UpdateMemberRole(ctx context.Context, arg UpdateMemberRoleParams) error {
 	_, err := q.db.ExecContext(ctx, updateMemberRole, arg.Role, arg.OrganizationId, arg.UserId)
+	return err
+}
+
+const updateTeam = `-- name: UpdateTeam :exec
+UPDATE "organization"
+SET "slug" = $1,
+    "updatedAt" = $2,
+    "name" = COALESCE($3, "name"),
+    "logo" = CASE WHEN $4::boolean THEN NULL ELSE COALESCE($5, "logo") END
+WHERE id = $6
+`
+
+type UpdateTeamParams struct {
+	Slug      string
+	UpdatedAt sql.NullTime
+	Name      sql.NullString
+	ClearLogo bool
+	Logo      sql.NullString
+	ID        string
+}
+
+// Team metadata update. A null name/logo leaves the column unchanged;
+// clear_logo forces logo to NULL (explicit clearing).
+func (q *Queries) UpdateTeam(ctx context.Context, arg UpdateTeamParams) error {
+	_, err := q.db.ExecContext(ctx, updateTeam,
+		arg.Slug,
+		arg.UpdatedAt,
+		arg.Name,
+		arg.ClearLogo,
+		arg.Logo,
+		arg.ID,
+	)
+	return err
+}
+
+const updateTeamStats = `-- name: UpdateTeamStats :exec
+UPDATE "organization"
+SET "rankingAverage" = COALESCE($1, "rankingAverage"),
+    "pointsAverage" = COALESCE($2, "pointsAverage"),
+    "seasonRank" = COALESCE($3, "seasonRank"),
+    "averagePointsPerEvent" = COALESCE($4, "averagePointsPerEvent")
+WHERE id = $5
+`
+
+type UpdateTeamStatsParams struct {
+	RankingAverage        sql.NullFloat64
+	PointsAverage         sql.NullFloat64
+	SeasonRank            sql.NullInt32
+	AveragePointsPerEvent sql.NullFloat64
+	ID                    string
+}
+
+// Team stats update. Null leaves the column unchanged (no explicit-null
+// clearing exists for stats, so plain COALESCE is lossless).
+func (q *Queries) UpdateTeamStats(ctx context.Context, arg UpdateTeamStatsParams) error {
+	_, err := q.db.ExecContext(ctx, updateTeamStats,
+		arg.RankingAverage,
+		arg.PointsAverage,
+		arg.SeasonRank,
+		arg.AveragePointsPerEvent,
+		arg.ID,
+	)
 	return err
 }
 

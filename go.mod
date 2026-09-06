@@ -4,6 +4,8 @@ go 1.26
 
 require (
 	encore.dev v1.57.13
+	github.com/lib/pq v1.10.9
+	github.com/sqlc-dev/pqtype v0.3.0
 	golang.org/x/oauth2 v0.36.0
 )
 
@@ -17,7 +19,6 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/pgx/v5 v5.7.6 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
-	github.com/sqlc-dev/pqtype v0.3.0 // indirect
 	github.com/yuin/gopher-lua v0.0.0-20210529063254-f4c35e4016d9 // indirect
 	golang.org/x/crypto v0.42.0 // indirect
 	golang.org/x/sync v0.17.0 // indirect

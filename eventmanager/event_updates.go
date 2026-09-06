@@ -5,12 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"strconv"
 	"time"
 
 	"encore.dev/beta/errs"
 	"encore.app/auth"
+	"encore.app/eventmanager/sqlc"
 	"encore.app/scorecalc"
+
+	"github.com/sqlc-dev/pqtype"
 )
 
 // UpdateEventRequest carries the editable fields plus the auth header. The
@@ -58,11 +60,7 @@ func jsonEqual(a, b []byte) bool {
 
 // UpdateEventCore updates an event's editable fields and returns its detail.
 func UpdateEventCore(ctx context.Context, p *UpdateEventRequest) (*EventDetail, error) {
-	existing, err := scanEventRow(db.QueryRow(ctx,
-		`SELECT `+eventColumns+` FROM "event" WHERE id = $1`, p.ID))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, &errs.Error{Code: errs.NotFound, Message: "event not found"}
-	}
+	existing, err := requireEventRow(ctx, p.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -100,30 +98,22 @@ func UpdateEventCore(ctx context.Context, p *UpdateEventRequest) (*EventDetail, 
 
 	// Capacity checks before reducing a limit.
 	if !isGranular && participantLimit != nil {
-		var currentCount int
-		if err := db.QueryRow(ctx,
-			`SELECT COUNT(*) FROM "event_member" WHERE "eventId" = $1`, p.ID,
-		).Scan(&currentCount); err != nil {
+		currentCount64, err := q().GetEventMemberCount(ctx, p.ID)
+		if err != nil {
 			return nil, err
 		}
-		if err := AssertLimitCanBeReduced(currentCount, *participantLimit,
+		if err := AssertLimitCanBeReduced(int(currentCount64), *participantLimit,
 			CodeParticipantLimitBelowEnrollment,
 			"Participant limit cannot be lower than the current enrollment"); err != nil {
 			return nil, err
 		}
 	}
 	if isGranular && maxConcurrent != nil {
-		var maxJoined int
-		if err := db.QueryRow(ctx,
-			`SELECT COALESCE(MAX(c), 0) FROM (
-			   SELECT COUNT(*) AS c FROM "race_event_member" m
-			   JOIN "race_event" r ON r.id = m."raceEventId"
-			   WHERE r."eventId" = $1 GROUP BY m."userId"
-			 ) t`, p.ID,
-		).Scan(&maxJoined); err != nil {
+		maxJoined, err := q().GetMaxRaceEnrollment(ctx, p.ID)
+		if err != nil {
 			return nil, err
 		}
-		if err := AssertLimitCanBeReduced(maxJoined, *maxConcurrent,
+		if err := AssertLimitCanBeReduced(int(maxJoined), *maxConcurrent,
 			CodeParticipantLimitBelowEnrollment,
 			"Max races limit cannot be lower than any member's current race enrollment count"); err != nil {
 			return nil, err
@@ -189,14 +179,13 @@ func UpdateEventCore(ctx context.Context, p *UpdateEventRequest) (*EventDetail, 
 		}
 	}
 
-	// Build the dynamic UPDATE.
-	type setClause struct {
-		clause string
-		arg    any
-	}
-	var sets []setClause
+	// Static UPDATE with tri-state params (see UpdateEvent query): set flags
+	// distinguish "leave unchanged" from "clear to NULL".
+	params := sqlc.UpdateEventParams{UpdatedAt: time.Now().UTC(), ID: p.ID}
+	hasUpdate := false
 	if p.Name != nil {
-		sets = append(sets, setClause{"name = ?", truncate(*p.Name, 255)})
+		params.Name = sql.NullString{String: truncate(*p.Name, 255), Valid: true}
+		hasUpdate = true
 	}
 	if p.Tag != nil && *p.Tag != "" {
 		tag := *p.Tag
@@ -210,73 +199,62 @@ func UpdateEventCore(ctx context.Context, p *UpdateEventRequest) (*EventDetail, 
 		} else if tag != "COMMUNITY" {
 			return nil, &errs.Error{Code: errs.InvalidArgument, Message: "tag must be OFFICIAL or COMMUNITY"}
 		}
-		sets = append(sets, setClause{"tag = ?", tag})
+		params.Tag = sql.NullString{String: tag, Valid: true}
+		hasUpdate = true
 	}
 	if p.Description.Set {
-		var v any
-		if p.Description.Value != nil {
-			v = *p.Description.Value
-		}
-		sets = append(sets, setClause{"description = ?", v})
+		params.DescSet = true
+		params.DescVal = nullStringFromPtr(p.Description.Value)
+		hasUpdate = true
 	}
 	if updatedScoringRulesMode != nil {
-		sets = append(sets, setClause{"\"scoringRulesMode\" = ?", *updatedScoringRulesMode})
+		params.Mode = sql.NullString{String: *updatedScoringRulesMode, Valid: true}
+		hasUpdate = true
 	}
 	if updatedCustomTables != nil {
-		sets = append(sets, setClause{"\"customScoringTables\" = ?", string(updatedCustomTables)})
+		params.CtSet = true
+		params.CtVal = pqtype.NullRawMessage{RawMessage: updatedCustomTables, Valid: true}
+		hasUpdate = true
 	} else if clearCustomTables {
-		sets = append(sets, setClause{"\"customScoringTables\" = ?", nil})
+		params.CtClear = true
+		hasUpdate = true
 	}
 	if p.ClassRestriction.Set {
-		var v any
+		params.ClassSet = true
 		if p.ClassRestriction.Value != nil && *p.ClassRestriction.Value != "" {
-			v = *p.ClassRestriction.Value
+			params.ClassVal = *p.ClassRestriction.Value
 		}
-		sets = append(sets, setClause{"\"classRestriction\" = ?", v})
+		hasUpdate = true
 	}
 	if p.ScheduledAt.Set {
-		var v any
+		params.SchedSet = true
 		if p.ScheduledAt.Value != nil && *p.ScheduledAt.Value != "" {
 			t, err := time.Parse(time.RFC3339Nano, *p.ScheduledAt.Value)
 			if err != nil {
 				return nil, &errs.Error{Code: errs.InvalidArgument, Message: "scheduledAt must be an ISO-8601 timestamp"}
 			}
 			utc := t.UTC()
-			v = utc
+			params.SchedVal = sql.NullTime{Time: utc, Valid: true}
 		}
-		sets = append(sets, setClause{"\"scheduledAt\" = ?", v})
+		hasUpdate = true
 	}
 	if participantLimit != nil {
-		sets = append(sets, setClause{"\"participantLimit\" = ?", *participantLimit})
+		params.PlVal = sql.NullInt32{Int32: int32(*participantLimit), Valid: true}
+		hasUpdate = true
 	} else if clearParticipantLimit {
-		sets = append(sets, setClause{"\"participantLimit\" = ?", nil})
+		params.PlClear = true
+		hasUpdate = true
 	}
 	if maxConcurrent != nil {
-		sets = append(sets, setClause{"\"maxConcurrentRaceParticipations\" = ?", *maxConcurrent})
+		params.McVal = sql.NullInt32{Int32: int32(*maxConcurrent), Valid: true}
+		hasUpdate = true
 	} else if clearMaxConcurrent {
-		sets = append(sets, setClause{"\"maxConcurrentRaceParticipations\" = ?", nil})
+		params.McClear = true
+		hasUpdate = true
 	}
 
-	now := time.Now().UTC()
-	if len(sets) > 0 {
-		query := `UPDATE "event" SET "updatedAt" = $1`
-		args := []any{now}
-		for _, s := range sets {
-			// Replace the ? placeholder with the next positional arg.
-			clause := ""
-			for i := 0; i < len(s.clause); i++ {
-				if s.clause[i] == '?' {
-					args = append(args, s.arg)
-					clause += "$" + strconv.Itoa(len(args))
-				} else {
-					clause += string(s.clause[i])
-				}
-			}
-			query += ", " + clause
-		}
-		args = append(args, p.ID)
-		query += " WHERE id = $" + strconv.Itoa(len(args))
-		if _, err := db.Exec(ctx, query, args...); err != nil {
+	if hasUpdate {
+		if err := q().UpdateEvent(ctx, params); err != nil {
 			return nil, err
 		}
 	}
@@ -324,48 +302,39 @@ func resolveResultPoints(mode string, custom any, r *storedResultRow) int {
 // Mirrors ts-legacy/eventmanager/events.ts recomputeEventPointsInternal
 // (minus the results-owned auto-deferral pass, which lives with results.ts).
 func recomputeEventPoints(ctx context.Context, eventID string) error {
-	var scoringType int
-	var scoringRulesMode sql.NullString
-	var customTables []byte
-	err := db.QueryRow(ctx,
-		`SELECT "scoringType", "scoringRulesMode", "customScoringTables" FROM "event" WHERE id = $1`,
-		eventID,
-	).Scan(&scoringType, &scoringRulesMode, &customTables)
+	rules, err := q().GetEventScoringRules(ctx, eventID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if scoringType != ScoringPoints {
+	if int(rules.ScoringType) != ScoringPoints {
 		return nil
 	}
 	mode := ""
-	if scoringRulesMode.Valid {
-		mode = scoringRulesMode.String
+	if rules.ScoringRulesMode.Valid {
+		mode = rules.ScoringRulesMode.String
 	}
 	var custom any
-	if len(customTables) > 0 {
+	if rules.CustomScoringTables.Valid && len(rules.CustomScoringTables.RawMessage) > 0 {
 		var v any
-		if err := json.Unmarshal(customTables, &v); err == nil {
+		if err := json.Unmarshal(rules.CustomScoringTables.RawMessage, &v); err == nil {
 			custom = v
 		}
 	}
 
-	rows, err := db.Query(ctx,
-		`SELECT res.id, res."userId", res.position, res.points, res."resultStatus", r.grade
-		 FROM "race_result" res JOIN "race_event" r ON r.id = res."raceEventId"
-		 WHERE r."eventId" = $1`, eventID)
+	rows, err := q().ListStoredResultRows(ctx, eventID)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 	affected := map[string]bool{}
 	var stale []storedResultRow
-	for rows.Next() {
-		var r storedResultRow
-		if err := rows.Scan(&r.ID, &r.UserID, &r.Position, &r.Points, &r.ResultStatus, &r.Grade); err != nil {
-			return err
+	for _, sr := range rows {
+		r := storedResultRow{
+			ID: sr.ID, UserID: sr.UserId,
+			Position: sql.NullInt64{Int64: int64(sr.Position.Int32), Valid: sr.Position.Valid},
+			Points:   int(sr.Points), ResultStatus: sr.ResultStatus, Grade: sr.Grade,
 		}
 		calculated := resolveResultPoints(mode, custom, &r)
 		if r.Points != calculated {
@@ -373,13 +342,11 @@ func recomputeEventPoints(ctx context.Context, eventID string) error {
 		}
 		affected[r.UserID] = true
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
 	for _, r := range stale {
 		calculated := resolveResultPoints(mode, custom, &r)
-		if _, err := db.Exec(ctx,
-			`UPDATE "race_result" SET points = $1 WHERE id = $2`, calculated, r.ID); err != nil {
+		if err := q().UpdateRaceResultPoints(ctx, sqlc.UpdateRaceResultPointsParams{
+			Points: int32(calculated), ID: r.ID,
+		}); err != nil {
 			return err
 		}
 	}

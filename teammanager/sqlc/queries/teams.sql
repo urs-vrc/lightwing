@@ -97,3 +97,30 @@ DELETE FROM "member" WHERE "organizationId" = $1 AND "userId" = $2;
 
 -- name: CountAdmins :one
 SELECT COUNT(*) FROM "member" WHERE "organizationId" = $1 AND role = $2;
+
+-- Batch member/admin counts for a page of orgs (used by listTeams).
+-- name: BatchCountMembersAndAdmins :many
+SELECT "organizationId", COUNT(*), COUNT(*) FILTER (WHERE role = $1)
+FROM "member"
+WHERE "organizationId" = ANY($2::text[])
+GROUP BY "organizationId";
+
+-- Team metadata update. A null name/logo leaves the column unchanged;
+-- clear_logo forces logo to NULL (explicit clearing).
+-- name: UpdateTeam :exec
+UPDATE "organization"
+SET "slug" = sqlc.arg('slug'),
+    "updatedAt" = sqlc.arg('updated_at'),
+    "name" = COALESCE(sqlc.narg('name'), "name"),
+    "logo" = CASE WHEN sqlc.arg('clear_logo')::boolean THEN NULL ELSE COALESCE(sqlc.narg('logo'), "logo") END
+WHERE id = sqlc.arg('id');
+
+-- Team stats update. Null leaves the column unchanged (no explicit-null
+-- clearing exists for stats, so plain COALESCE is lossless).
+-- name: UpdateTeamStats :exec
+UPDATE "organization"
+SET "rankingAverage" = COALESCE(sqlc.narg('ranking_average'), "rankingAverage"),
+    "pointsAverage" = COALESCE(sqlc.narg('points_average'), "pointsAverage"),
+    "seasonRank" = COALESCE(sqlc.narg('season_rank'), "seasonRank"),
+    "averagePointsPerEvent" = COALESCE(sqlc.narg('average_points_per_event'), "averagePointsPerEvent")
+WHERE id = sqlc.arg('id');

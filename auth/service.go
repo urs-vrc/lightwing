@@ -18,6 +18,7 @@ import (
 	"encore.dev/rlog"
 	"encore.dev/storage/cache"
 	"encore.dev/beta/errs"
+	"encore.app/auth/sqlc"
 	"encore.app/shared"
 	"golang.org/x/oauth2"
 )
@@ -305,10 +306,7 @@ func (s *Service) getDiscordGuildMember(ctx context.Context, userID string) (*di
 //
 // Mirrors ts-legacy/auth/auth.ts isBootstrapSiteAdminUser
 func (s *Service) isBootstrapSiteAdminUser(ctx context.Context, userId string) (bool, error) {
-	var firstUserId string
-	err := db.QueryRow(ctx,
-		`SELECT id FROM "user" ORDER BY "createdAt" ASC LIMIT 1`,
-	).Scan(&firstUserId)
+	firstUserId, err := q().GetFirstUserID(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -329,11 +327,7 @@ func (s *Service) syncSiteRoleFromDiscordMembership(ctx context.Context, userId 
 	}
 
 	// Look up the Discord account ID for this user.
-	var accountId string
-	err := db.QueryRow(ctx,
-		`SELECT "accountId" FROM "account" WHERE "userId" = $1 AND "providerId" = 'discord' ORDER BY "updatedAt" DESC LIMIT 1`,
-		userId,
-	).Scan(&accountId)
+	accountId, err := q().GetDiscordAccountID(ctx, userId)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// User has no Discord account linked — they can't be staff.
@@ -379,20 +373,17 @@ func (s *Service) syncSiteRoleFromDiscordMembership(ctx context.Context, userId 
 	}
 
 	// Get current site role
-	var currentSiteRole string
-	err = db.QueryRow(ctx,
-		`SELECT "siteRole" FROM "user" WHERE id = $1`, userId,
-	).Scan(&currentSiteRole)
+	currentSiteRole, err := q().GetUserSiteRole(ctx, userId)
 	if err != nil {
 		return fmt.Errorf("failed to fetch current site role: %w", err)
 	}
 
 	if currentSiteRole != nextSiteRole {
 		rlog.Info(fmt.Sprintf("Updating site role for user ID %s from %s to %s", userId, currentSiteRole, nextSiteRole))
-		_, err = db.Exec(ctx,
-			`UPDATE "user" SET "siteRole" = $1 WHERE id = $2`,
-			nextSiteRole, userId,
-		)
+		err = q().UpdateUserSiteRole(ctx, sqlc.UpdateUserSiteRoleParams{
+			SiteRole: nextSiteRole,
+			ID:       userId,
+		})
 		if err != nil {
 			return fmt.Errorf("failed to update site role: %w", err)
 		}
@@ -438,28 +429,27 @@ func (s *Service) storeOAuthState(ctx context.Context, state, redirect, errorRed
 		return fmt.Errorf("failed to encode OAuth state: %w", err)
 	}
 	now := time.Now().UTC()
-	_, err = db.Exec(ctx,
-		`INSERT INTO "verification" ("id", "identifier", "value", "expiresAt", "createdAt", "updatedAt")
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
-		"oauth_state:"+state, "oauth_state:"+state, string(value),
-		now.Add(5*time.Minute), now, now,
-	)
+	err = q().StoreOAuthState(ctx, sqlc.StoreOAuthStateParams{
+		Identifier: "oauth_state:" + state,
+		StateValue: string(value),
+		ExpiresAt:  now.Add(5 * time.Minute),
+		Now:        sql.NullTime{Time: now, Valid: true},
+	})
 	return err
 }
 
 // consumeOAuthState retrieves and deletes the stored OAuth state, returning
 // the redirect targets.
 func (s *Service) consumeOAuthState(ctx context.Context, state string) (oauthRedirect, error) {
-	var raw string
-	err := db.QueryRow(ctx,
-		`SELECT "value" FROM "verification" WHERE "identifier" = $1 AND "expiresAt" > $2`,
-		"oauth_state:"+state, time.Now().UTC(),
-	).Scan(&raw)
+	raw, err := q().GetOAuthStateValue(ctx, sqlc.GetOAuthStateValueParams{
+		Identifier: "oauth_state:" + state,
+		ExpiresAt:  time.Now().UTC(),
+	})
 	if err != nil {
 		return oauthRedirect{}, err
 	}
 	// Delete the state (single use)
-	_, _ = db.Exec(ctx, `DELETE FROM "verification" WHERE "identifier" = $1`, "oauth_state:"+state)
+	_ = q().DeleteVerificationByIdentifier(ctx, "oauth_state:"+state)
 	var redir oauthRedirect
 	if err := json.Unmarshal([]byte(raw), &redir); err != nil {
 		// Plain-string rows predate the JSON envelope; treat as redirect only.

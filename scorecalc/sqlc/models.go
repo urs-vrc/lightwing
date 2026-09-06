@@ -49,7 +49,7 @@ type Event struct {
 	UpdatedAt                       time.Time
 	OwnerType                       interface{}
 	OwnerUserId                     sql.NullString
-	Status                          interface{}
+	Status                          string
 	GranularParticipation           bool
 	SignupsLocked                   bool
 	CustomScoringTables             pqtype.NullRawMessage
@@ -57,6 +57,8 @@ type Event struct {
 	ScheduledAt                     sql.NullTime
 	ParticipantLimit                sql.NullInt32
 	MaxConcurrentRaceParticipations sql.NullInt32
+	Tag                             string
+	DeletedAt                       sql.NullTime
 }
 
 type EventAdmin struct {

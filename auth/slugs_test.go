@@ -133,7 +133,7 @@ func Test_generateUniqueUserSlug(t *testing.T) {
 	}
 
 	// Same name for a different user resolves with a numeric suffix.
-	slug, err := GenerateUniqueUserSlug(stdlibDB, "CollisionUser", "discord-user-2")
+	slug, err := GenerateUniqueUserSlug(ctx, stdlibDB, "CollisionUser", "discord-user-2")
 	if err != nil {
 		t.Fatalf("GenerateUniqueUserSlug failed: %v", err)
 	}
@@ -154,7 +154,7 @@ func Test_generateUniqueUserSlug(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to insert user: %v", err)
 	}
-	slug2, err := GenerateUniqueUserSlug(stdlibDB, "CollisionUser", "discord-user-3")
+	slug2, err := GenerateUniqueUserSlug(ctx, stdlibDB, "CollisionUser", "discord-user-3")
 	if err != nil {
 		t.Fatalf("GenerateUniqueUserSlug failed: %v", err)
 	}
@@ -185,7 +185,7 @@ func Test_generateUniqueOrgSlug(t *testing.T) {
 	}
 
 	// Same name should produce a different slug with suffix
-	slug, err := GenerateUniqueOrgSlug(stdlibDB, "Sg Team")
+	slug, err := GenerateUniqueOrgSlug(ctx, stdlibDB, "Sg Team")
 	if err != nil {
 		t.Fatalf("GenerateUniqueOrgSlug failed: %v", err)
 	}
@@ -194,7 +194,7 @@ func Test_generateUniqueOrgSlug(t *testing.T) {
 	}
 
 	// Different name should produce the slugified name
-	slug2, err := GenerateUniqueOrgSlug(stdlibDB, "Sg New Team")
+	slug2, err := GenerateUniqueOrgSlug(ctx, stdlibDB, "Sg New Team")
 	if err != nil {
 		t.Fatalf("GenerateUniqueOrgSlug failed: %v", err)
 	}

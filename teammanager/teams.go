@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"encore.dev/beta/errs"
@@ -61,32 +60,20 @@ func batchCountMembersAndAdmins(ctx context.Context, orgIDs []string) (map[strin
 	if len(orgIDs) == 0 {
 		return map[string]teamCounts{}, nil
 	}
-	rows, err := db.Query(ctx,
-		`SELECT "organizationId", COUNT(*), COUNT(*) FILTER (WHERE role = $1)
-		 FROM "member"
-		 WHERE "organizationId" = ANY($2)
-		 GROUP BY "organizationId"`,
-		auth.AdministratorRole, orgIDs,
-	)
+	rows, err := q().BatchCountMembersAndAdmins(ctx, sqlc.BatchCountMembersAndAdminsParams{
+		Role:    auth.AdministratorRole,
+		Column2: orgIDs,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to batch count members and admins: %w", err)
 	}
-	defer rows.Close()
 
 	res := make(map[string]teamCounts)
-	for rows.Next() {
-		var orgID string
-		var memberCount, adminCount int64
-		if err := rows.Scan(&orgID, &memberCount, &adminCount); err != nil {
-			return nil, fmt.Errorf("failed to scan team member counts: %w", err)
+	for _, r := range rows {
+		res[r.OrganizationId] = teamCounts{
+			memberCount: int(r.Count),
+			adminCount:  int(r.Count_2),
 		}
-		res[orgID] = teamCounts{
-			memberCount: int(memberCount),
-			adminCount:  int(adminCount),
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate team member counts: %w", err)
 	}
 	return res, nil
 }
@@ -227,23 +214,21 @@ func updateTeam(ctx context.Context, authorization, id string, p *UpdateTeamPara
 		}
 		nextSlug = *p.Slug
 	}
-	set := []string{`"slug" = $1`, `"updatedAt" = $2`}
-	args := []any{nextSlug, time.Now().UTC()}
+	var name, logo sql.NullString
 	if p.Name != nil {
-		args = append(args, *p.Name)
-		set = append(set, fmt.Sprintf(`"name" = $%d`, len(args)))
+		name = sql.NullString{String: *p.Name, Valid: true}
 	}
-	if p.ClearLogo {
-		set = append(set, `"logo" = NULL`)
-	} else if p.Logo != nil {
-		args = append(args, *p.Logo)
-		set = append(set, fmt.Sprintf(`"logo" = $%d`, len(args)))
+	if p.Logo != nil {
+		logo = sql.NullString{String: *p.Logo, Valid: true}
 	}
-	args = append(args, id)
-	_, err = db.Exec(ctx,
-		`UPDATE "organization" SET `+strings.Join(set, ", ")+fmt.Sprintf(` WHERE id = $%d`, len(args)),
-		args...,
-	)
+	err = q().UpdateTeam(ctx, sqlc.UpdateTeamParams{
+		Slug:      nextSlug,
+		UpdatedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
+		Name:      name,
+		ClearLogo: p.ClearLogo,
+		Logo:      logo,
+		ID:        id,
+	})
 	if isUniqueViolation(err) {
 		return nil, &errs.Error{Code: errs.AlreadyExists, Message: "team slug is already in use"}
 	}

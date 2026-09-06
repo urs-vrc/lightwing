@@ -4,11 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
-	"strings"
 
 	"encore.dev/beta/errs"
 	"encore.app/auth"
+	"encore.app/teammanager/sqlc"
 )
 
 // --- updateTeamStats (mirrors ts-legacy/teammanager/team-stats.ts) ---
@@ -35,35 +34,33 @@ func updateTeamStats(ctx context.Context, authorization, id string, p *TeamStats
 	} else if err != nil {
 		return nil, err
 	}
-	set := []string{}
-	args := []any{}
+	if p.RankingAverage == nil && p.PointsAverage == nil && p.SeasonRank == nil && p.AveragePointsPerEvent == nil {
+		return loadTeam(ctx, id)
+	}
+	var rankingAverage, pointsAverage, averagePointsPerEvent sql.NullFloat64
 	if p.RankingAverage != nil {
-		args = append(args, *p.RankingAverage)
-		set = append(set, fmt.Sprintf(`"rankingAverage" = $%d`, len(args)))
+		rankingAverage = sql.NullFloat64{Float64: *p.RankingAverage, Valid: true}
 	}
 	if p.PointsAverage != nil {
-		args = append(args, *p.PointsAverage)
-		set = append(set, fmt.Sprintf(`"pointsAverage" = $%d`, len(args)))
-	}
-	if p.SeasonRank != nil {
-		args = append(args, *p.SeasonRank)
-		set = append(set, fmt.Sprintf(`"seasonRank" = $%d`, len(args)))
+		pointsAverage = sql.NullFloat64{Float64: *p.PointsAverage, Valid: true}
 	}
 	if p.AveragePointsPerEvent != nil {
-		args = append(args, *p.AveragePointsPerEvent)
-		set = append(set, fmt.Sprintf(`"averagePointsPerEvent" = $%d`, len(args)))
+		averagePointsPerEvent = sql.NullFloat64{Float64: *p.AveragePointsPerEvent, Valid: true}
 	}
-	if len(set) > 0 {
-		args = append(args, id)
-		_, err := db.Exec(ctx,
-			`UPDATE "organization" SET `+strings.Join(set, ", ")+fmt.Sprintf(` WHERE id = $%d`, len(args)),
-			args...,
-		)
-		if err != nil {
-			return nil, err
-		}
-		invalidateTeamCache(ctx, id)
+	var seasonRank sql.NullInt32
+	if p.SeasonRank != nil {
+		seasonRank = sql.NullInt32{Int32: *p.SeasonRank, Valid: true}
 	}
+	if err := q().UpdateTeamStats(ctx, sqlc.UpdateTeamStatsParams{
+		RankingAverage:        rankingAverage,
+		PointsAverage:         pointsAverage,
+		SeasonRank:            seasonRank,
+		AveragePointsPerEvent: averagePointsPerEvent,
+		ID:                    id,
+	}); err != nil {
+		return nil, err
+	}
+	invalidateTeamCache(ctx, id)
 	return loadTeam(ctx, id)
 }
 

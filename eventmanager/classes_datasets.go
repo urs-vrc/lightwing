@@ -8,6 +8,7 @@ import (
 
 	"encore.dev/beta/errs"
 	"encore.app/auth"
+	"encore.app/eventmanager/sqlc"
 )
 
 // Class tiers and datasets endpoints.
@@ -64,16 +65,20 @@ func SetUserClassCore(ctx context.Context, p *SetUserClassRequest) (*SetUserClas
 	} else if _, err := auth.RequireSiteAdmin(ctx, p.Authorization); err != nil {
 		return nil, err
 	}
-	var exists bool
-	if err := db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM "user" WHERE id=$1)`, p.UserID).Scan(&exists); err != nil {
+	exists, err := q().UserExists(ctx, p.UserID)
+	if err != nil {
 		return nil, err
 	}
 	if !exists {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "user not found"}
 	}
-	if _, err := db.Exec(ctx,
-		`UPDATE "user" SET "classTier"=$1 WHERE id=$2`, p.ClassTier, p.UserID); err != nil {
+	var tier any
+	if p.ClassTier != nil {
+		tier = *p.ClassTier
+	}
+	if err := q().UpdateUserClassTier(ctx, sqlc.UpdateUserClassTierParams{
+		ClassTier: tier, ID: p.UserID,
+	}); err != nil {
 		return nil, err
 	}
 	return &SetUserClassResponse{UserID: p.UserID, ClassTier: p.ClassTier}, nil
@@ -114,21 +119,20 @@ type EligibleEventsResponse struct {
 // ListEligibleEventsCore returns events the participant may enter based on
 // class tier and each event's class restriction.
 func ListEligibleEventsCore(ctx context.Context, q *EligibleEventsQuery) (*EligibleEventsResponse, error) {
-	var userTier sql.NullString
-	if err := db.QueryRow(ctx,
-		`SELECT "classTier" FROM "user" WHERE id=$1`, q.UserID).Scan(&userTier); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, &errs.Error{Code: errs.NotFound, Message: "user not found"}
-		}
+	tierAny, err := sqlc.New(std()).GetUserClassTier(ctx, q.UserID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, &errs.Error{Code: errs.NotFound, Message: "user not found"}
+	}
+	if err != nil {
 		return nil, err
 	}
+	userTier := nullStringFromAny(tierAny)
 	var tier *ClassTier
 	if userTier.Valid {
 		t := ClassTier(userTier.String)
 		tier = &t
 	}
-	erows, err := db.Query(ctx,
-		`SELECT id, name, "organizationId", "classRestriction" FROM "event" ORDER BY "createdAt" DESC`)
+	erows, err := sqlc.New(std()).ListEligibleEvents(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -139,17 +143,11 @@ func ListEligibleEventsCore(ctx context.Context, q *EligibleEventsQuery) (*Eligi
 		classRestr   sql.NullString
 	}
 	var events []eventInfo
-	for erows.Next() {
-		var e eventInfo
-		if err := erows.Scan(&e.id, &e.name, &e.orgID, &e.classRestr); err != nil {
-			erows.Close()
-			return nil, err
-		}
-		events = append(events, e)
-	}
-	erows.Close()
-	if err := erows.Err(); err != nil {
-		return nil, err
+	for _, er := range erows {
+		events = append(events, eventInfo{
+			id: er.ID, name: er.Name, orgID: er.OrganizationId,
+			classRestr: nullStringFromAny(er.ClassRestriction),
+		})
 	}
 	resp := &EligibleEventsResponse{Events: []*EligibleEvent{}}
 	for _, e := range events {
@@ -159,20 +157,13 @@ func ListEligibleEventsCore(ctx context.Context, q *EligibleEventsQuery) (*Eligi
 			eventRestr = &t
 		}
 		eventEligible := IsEligible(tier, eventRestr)
-		rrows, err := db.Query(ctx,
-			`SELECT id, name, sequence, "classRestriction" FROM "race_event" WHERE "eventId"=$1 ORDER BY sequence ASC`, e.id)
+		rrows, err := sqlc.New(std()).ListEligibleRaces(ctx, e.id)
 		if err != nil {
 			return nil, err
 		}
 		eligibleRaces := []EligibleRace{}
-		for rrows.Next() {
-			var rid, rname string
-			var seq int
-			var rc sql.NullString
-			if err := rrows.Scan(&rid, &rname, &seq, &rc); err != nil {
-				rrows.Close()
-				return nil, err
-			}
+		for _, rr := range rrows {
+			rc := nullStringFromAny(rr.ClassRestriction)
 			effective := eventRestr
 			if rc.Valid {
 				t := ClassTier(rc.String)
@@ -185,13 +176,9 @@ func ListEligibleEventsCore(ctx context.Context, q *EligibleEventsQuery) (*Eligi
 					effStr = &s
 				}
 				eligibleRaces = append(eligibleRaces, EligibleRace{
-					ID: rid, Name: rname, Sequence: seq, ClassRestriction: effStr,
+					ID: rr.ID, Name: rr.Name, Sequence: int(rr.Sequence), ClassRestriction: effStr,
 				})
 			}
-		}
-		rrows.Close()
-		if err := rrows.Err(); err != nil {
-			return nil, err
 		}
 		if eventEligible || len(eligibleRaces) > 0 {
 			resp.Events = append(resp.Events, &EligibleEvent{
@@ -259,28 +246,31 @@ type DatasetsResponse struct {
 	Datasets []*DatasetView `json:"datasets"`
 }
 
+// toDatasetRow maps a sqlc dataset row onto the local datasetRow.
+func toDatasetRow(id, eventID, source string, rows int32, status any, importedAt sql.NullTime, createdAt, updatedAt time.Time) *datasetRow {
+	return &datasetRow{
+		ID: id, EventID: eventID, Source: source, Rows: int(rows),
+		Status: stringFromAny(status), ImportedAt: timePtrFromNull(importedAt),
+		CreatedAt: createdAt, UpdatedAt: updatedAt,
+	}
+}
+
 // ListDatasetsCore lists datasets scoped by event.
 func ListDatasetsCore(ctx context.Context, q *DatasetsQuery) (*DatasetsResponse, error) {
 	if _, err := requireEventRow(ctx, q.EventID); err != nil {
 		return nil, err
 	}
-	rows, err := db.Query(ctx,
-		`SELECT id, "eventId", source, rows, status, "importedAt", "createdAt", "updatedAt"
-		 FROM "dataset" WHERE "eventId"=$1 ORDER BY "createdAt" DESC`, q.EventID)
+	drows, err := sqlc.New(std()).ListDatasetsByEvent(ctx, q.EventID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	resp := &DatasetsResponse{Datasets: []*DatasetView{}}
-	for rows.Next() {
-		var d datasetRow
-		if err := rows.Scan(&d.ID, &d.EventID, &d.Source, &d.Rows, &d.Status,
-			&d.ImportedAt, &d.CreatedAt, &d.UpdatedAt); err != nil {
-			return nil, err
-		}
-		resp.Datasets = append(resp.Datasets, toDatasetView(&d))
+	for _, dr := range drows {
+		resp.Datasets = append(resp.Datasets, toDatasetView(toDatasetRow(
+			dr.ID, dr.EventId, dr.Source, dr.Rows, dr.Status,
+			dr.ImportedAt, dr.CreatedAt, dr.UpdatedAt)))
 	}
-	return resp, rows.Err()
+	return resp, nil
 }
 
 //encore:api public method=GET path=/api/datasets-list
@@ -316,18 +306,16 @@ func CreateDatasetCore(ctx context.Context, p *CreateDatasetRequest) (*DatasetVi
 	}
 	id := "dataset-" + newID()[:8]
 	now := time.Now().UTC()
-	var d datasetRow
-	err := db.QueryRow(ctx,
-		`INSERT INTO "dataset" (id, "eventId", source, rows, status, "importedAt", "createdAt", "updatedAt")
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$7)
-		 RETURNING id, "eventId", source, rows, status, "importedAt", "createdAt", "updatedAt"`,
-		id, p.EventID, p.Source, p.Rows, status, importedAt, now,
-	).Scan(&d.ID, &d.EventID, &d.Source, &d.Rows, &d.Status,
-		&d.ImportedAt, &d.CreatedAt, &d.UpdatedAt)
+	created, err := q().CreateDataset(ctx, sqlc.CreateDatasetParams{
+		ID: id, EventId: p.EventID, Source: p.Source, Rows: int32(p.Rows),
+		Status: status, ImportedAt: nullTimeFromPtr(importedAt), CreatedAt: now,
+	})
 	if err != nil {
 		return nil, err
 	}
-	return toDatasetView(&d), nil
+	return toDatasetView(toDatasetRow(
+		created.ID, created.EventId, created.Source, created.Rows, created.Status,
+		created.ImportedAt, created.CreatedAt, created.UpdatedAt)), nil
 }
 
 //encore:api public method=POST path=/api/datasets
@@ -351,34 +339,32 @@ func UpdateDatasetStatusCore(ctx context.Context, p *UpdateDatasetStatusRequest)
 	if _, err := auth.RequireEventPermission(ctx, p.Authorization, p.EventID, auth.ActionUpdate); err != nil {
 		return nil, err
 	}
-	var d datasetRow
-	err := db.QueryRow(ctx,
-		`SELECT id, "eventId", source, rows, status, "importedAt", "createdAt", "updatedAt"
-		 FROM "dataset" WHERE id=$1 AND "eventId"=$2`, p.DatasetID, p.EventID,
-	).Scan(&d.ID, &d.EventID, &d.Source, &d.Rows, &d.Status,
-		&d.ImportedAt, &d.CreatedAt, &d.UpdatedAt)
+	fetched, err := q().GetDatasetByID(ctx, sqlc.GetDatasetByIDParams{
+		ID: p.DatasetID, EventId: p.EventID,
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "dataset not found"}
 	}
 	if err != nil {
 		return nil, err
 	}
+	d := toDatasetRow(
+		fetched.ID, fetched.EventId, fetched.Source, fetched.Rows, fetched.Status,
+		fetched.ImportedAt, fetched.CreatedAt, fetched.UpdatedAt)
 	importedAt := d.ImportedAt
 	if p.Status == "DONE" {
 		now := time.Now().UTC()
 		importedAt = &now
 	}
-	var updated datasetRow
-	err = db.QueryRow(ctx,
-		`UPDATE "dataset" SET status=$1, "importedAt"=$2 WHERE id=$3
-		 RETURNING id, "eventId", source, rows, status, "importedAt", "createdAt", "updatedAt"`,
-		p.Status, importedAt, p.DatasetID,
-	).Scan(&updated.ID, &updated.EventID, &updated.Source, &updated.Rows, &updated.Status,
-		&updated.ImportedAt, &updated.CreatedAt, &updated.UpdatedAt)
+	updated, err := q().UpdateDatasetStatus(ctx, sqlc.UpdateDatasetStatusParams{
+		Status: p.Status, ImportedAt: nullTimeFromPtr(importedAt), ID: p.DatasetID,
+	})
 	if err != nil {
 		return nil, err
 	}
-	return toDatasetView(&updated), nil
+	return toDatasetView(toDatasetRow(
+		updated.ID, updated.EventId, updated.Source, updated.Rows, updated.Status,
+		updated.ImportedAt, updated.CreatedAt, updated.UpdatedAt)), nil
 }
 
 //encore:api public method=PUT path=/api/dataset-status

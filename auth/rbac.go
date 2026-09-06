@@ -9,6 +9,8 @@ import (
 
 	"encore.dev/beta/errs"
 	"encore.dev/storage/cache"
+
+	"encore.app/auth/sqlc"
 )
 
 // Actor represents the authenticated caller resolved from a session token.
@@ -47,20 +49,14 @@ func resolveActor(ctx context.Context, authorization string) (*Actor, error) {
 	var activeOrgID sql.NullString
 	var expiresAt time.Time
 
-	err := db.QueryRow(ctx,
-		`SELECT s."userId", s."activeOrganizationId", u."siteRole", s."expiresAt"
-		 FROM "session" s
-		 JOIN "user" u ON u.id = s."userId"
-		 WHERE s."token" = $1`,
-		token,
-	).Scan(&userID, &activeOrgID, &siteRole, &expiresAt)
-
+	row, err := q().GetActorSession(ctx, token)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, &errs.Error{Code: errs.Unauthenticated, Message: "invalid or expired session"}
 	}
 	if err != nil {
 		return nil, err
 	}
+	userID, activeOrgID, siteRole, expiresAt = row.UserId, row.ActiveOrganizationId, row.USiteRole, row.ExpiresAt
 
 	if !expiresAt.After(time.Now()) {
 		return nil, &errs.Error{Code: errs.Unauthenticated, Message: "invalid or expired session"}
@@ -100,11 +96,10 @@ func getMemberRole(ctx context.Context, organizationId, userId string) (string, 
 		}
 	}
 
-	var role string
-	err := db.QueryRow(ctx,
-		`SELECT role FROM "member" WHERE "organizationId" = $1 AND "userId" = $2`,
-		organizationId, userId,
-	).Scan(&role)
+	role, err := q().GetMemberRole(ctx, sqlc.GetMemberRoleParams{
+		OrganizationId: organizationId,
+		UserId:         userId,
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		role = ""
 	} else if err != nil {
@@ -182,19 +177,14 @@ func requireEventPermission(ctx context.Context, authorization string, eventId s
 
 	// Load the event to check ownership. The non-applicable owner column is
 	// NULL (user-owned events have no organizationId and vice versa).
-	var ownerType string
-	var ownerUserID, organizationID sql.NullString
-	err = db.QueryRow(ctx,
-		`SELECT "ownerType", "ownerUserId", "organizationId" FROM "event" WHERE id = $1`,
-		eventId,
-	).Scan(&ownerType, &ownerUserID, &organizationID)
-
+	ownership, err := q().GetEventOwnership(ctx, eventId)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "event not found"}
 	}
 	if err != nil {
 		return nil, err
 	}
+	ownerType, ownerUserID, organizationID := ownership.OwnerType, ownership.OwnerUserId, ownership.OrganizationId
 
 	// Check user-owned
 	if ownerType == string(EventOwnerTypeUser) {
@@ -210,11 +200,10 @@ func requireEventPermission(ctx context.Context, authorization string, eventId s
 	}
 
 	// Check explicit EventAdmin row
-	var eventAdminExists bool
-	err = db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM "event_admin" WHERE "eventId" = $1 AND "userId" = $2)`,
-		eventId, actor.UserID,
-	).Scan(&eventAdminExists)
+	eventAdminExists, err := q().EventAdminExists(ctx, sqlc.EventAdminExistsParams{
+		EventId: eventId,
+		UserId:  actor.UserID,
+	})
 	if err != nil {
 		return nil, err
 	}

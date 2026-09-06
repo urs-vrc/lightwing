@@ -9,7 +9,211 @@ import (
 	"context"
 	"database/sql"
 	"time"
+
+	"github.com/lib/pq"
+	"github.com/sqlc-dev/pqtype"
 )
+
+const clearRaceResultPosition = `-- name: ClearRaceResultPosition :exec
+UPDATE "race_result" SET position = NULL WHERE id = $1
+`
+
+// Explicit-null clears (COALESCE above cannot clear).
+func (q *Queries) ClearRaceResultPosition(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, clearRaceResultPosition, id)
+	return err
+}
+
+const clearRaceResultPositionAndStatus = `-- name: ClearRaceResultPositionAndStatus :exec
+UPDATE "race_result" SET position = NULL, "resultStatus" = NULL WHERE id = $1
+`
+
+func (q *Queries) ClearRaceResultPositionAndStatus(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, clearRaceResultPositionAndStatus, id)
+	return err
+}
+
+const clearRaceResultStatus = `-- name: ClearRaceResultStatus :exec
+UPDATE "race_result" SET "resultStatus" = NULL WHERE id = $1
+`
+
+func (q *Queries) ClearRaceResultStatus(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, clearRaceResultStatus, id)
+	return err
+}
+
+const countEvents = `-- name: CountEvents :one
+SELECT COUNT(*) FROM "event" e
+WHERE ($1::text = '' OR e."organizationId" = $1)
+  AND ($2::text = '' OR e."classRestriction"::text = $2)
+  AND ($3::text = '' OR e.tag = $3)
+  AND ($4::text = '' OR e.status = $4)
+  AND ($4::text != '' OR $5::boolean OR e.status != 'PENDING_DELETION')
+`
+
+type CountEventsParams struct {
+	Column1 string
+	Column2 string
+	Column3 string
+	Column4 string
+	Column5 bool
+}
+
+// Event list count with optional filters (empty means absent).
+func (q *Queries) CountEvents(ctx context.Context, arg CountEventsParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countEvents,
+		arg.Column1,
+		arg.Column2,
+		arg.Column3,
+		arg.Column4,
+		arg.Column5,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countPublicEvents = `-- name: CountPublicEvents :one
+SELECT COUNT(*) FROM "event" e WHERE e.status IN ('PENDING','ONGOING','CONCLUDED')
+`
+
+// Public event list count.
+func (q *Queries) CountPublicEvents(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countPublicEvents)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const createDataset = `-- name: CreateDataset :one
+INSERT INTO "dataset" (id, "eventId", source, rows, status, "importedAt", "createdAt", "updatedAt")
+VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+RETURNING id, "eventId", source, rows, status, "importedAt", "createdAt", "updatedAt"
+`
+
+type CreateDatasetParams struct {
+	ID         string
+	EventId    string
+	Source     string
+	Rows       int32
+	Status     interface{}
+	ImportedAt sql.NullTime
+	CreatedAt  time.Time
+}
+
+// Dataset create with RETURNING.
+func (q *Queries) CreateDataset(ctx context.Context, arg CreateDatasetParams) (Dataset, error) {
+	row := q.db.QueryRowContext(ctx, createDataset,
+		arg.ID,
+		arg.EventId,
+		arg.Source,
+		arg.Rows,
+		arg.Status,
+		arg.ImportedAt,
+		arg.CreatedAt,
+	)
+	var i Dataset
+	err := row.Scan(
+		&i.ID,
+		&i.EventId,
+		&i.Source,
+		&i.Rows,
+		&i.Status,
+		&i.ImportedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const createEvent = `-- name: CreateEvent :exec
+INSERT INTO "event" (id, name, description, "ownerType", "organizationId", "ownerUserId",
+  status, tag, "scoringType", "scoringRulesMode", "customScoringTables", "classRestriction",
+  "granularParticipation", "scheduledAt", "participantLimit", "maxConcurrentRaceParticipations",
+  "createdAt", "updatedAt")
+VALUES ($1,$2,$3,$4,$5,$6,'DRAFT',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16)
+`
+
+type CreateEventParams struct {
+	ID                              string
+	Name                            string
+	Description                     sql.NullString
+	OwnerType                       interface{}
+	OrganizationId                  sql.NullString
+	OwnerUserId                     sql.NullString
+	Tag                             string
+	ScoringType                     int16
+	ScoringRulesMode                sql.NullString
+	CustomScoringTables             pqtype.NullRawMessage
+	ClassRestriction                interface{}
+	GranularParticipation           bool
+	ScheduledAt                     sql.NullTime
+	ParticipantLimit                sql.NullInt32
+	MaxConcurrentRaceParticipations sql.NullInt32
+	CreatedAt                       time.Time
+}
+
+// Event create.
+func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) error {
+	_, err := q.db.ExecContext(ctx, createEvent,
+		arg.ID,
+		arg.Name,
+		arg.Description,
+		arg.OwnerType,
+		arg.OrganizationId,
+		arg.OwnerUserId,
+		arg.Tag,
+		arg.ScoringType,
+		arg.ScoringRulesMode,
+		arg.CustomScoringTables,
+		arg.ClassRestriction,
+		arg.GranularParticipation,
+		arg.ScheduledAt,
+		arg.ParticipantLimit,
+		arg.MaxConcurrentRaceParticipations,
+		arg.CreatedAt,
+	)
+	return err
+}
+
+const deleteAbsentRaceResults = `-- name: DeleteAbsentRaceResults :exec
+DELETE FROM "race_result" WHERE "raceEventId" = $1 AND "userId" = ANY($2::text[])
+`
+
+type DeleteAbsentRaceResultsParams struct {
+	RaceEventId string
+	Column2     []string
+}
+
+// Bulk delete results absent from the payload.
+func (q *Queries) DeleteAbsentRaceResults(ctx context.Context, arg DeleteAbsentRaceResultsParams) error {
+	_, err := q.db.ExecContext(ctx, deleteAbsentRaceResults, arg.RaceEventId, pq.Array(arg.Column2))
+	return err
+}
+
+const deleteEventAdmin = `-- name: DeleteEventAdmin :exec
+DELETE FROM "event_admin" WHERE "eventId" = $1 AND "userId" = $2
+`
+
+type DeleteEventAdminParams struct {
+	EventId string
+	UserId  string
+}
+
+func (q *Queries) DeleteEventAdmin(ctx context.Context, arg DeleteEventAdminParams) error {
+	_, err := q.db.ExecContext(ctx, deleteEventAdmin, arg.EventId, arg.UserId)
+	return err
+}
+
+const deleteEventByID = `-- name: DeleteEventByID :exec
+DELETE FROM "event" WHERE id = $1
+`
+
+// Event deletion variants.
+func (q *Queries) DeleteEventByID(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, deleteEventByID, id)
+	return err
+}
 
 const deleteEventLadderByUser = `-- name: DeleteEventLadderByUser :exec
 DELETE FROM "event_ladder_entry" WHERE "eventId" = $1 AND "userId" = $2
@@ -97,6 +301,40 @@ func (q *Queries) DeleteRaceEventMemberByEvent(ctx context.Context, arg DeleteRa
 	return err
 }
 
+const deleteRaceResult = `-- name: DeleteRaceResult :execrows
+DELETE FROM "race_result" WHERE "raceEventId" = $1 AND "userId" = $2
+`
+
+type DeleteRaceResultParams struct {
+	RaceEventId string
+	UserId      string
+}
+
+// Delete with affected count (used by DeleteRaceResult).
+func (q *Queries) DeleteRaceResult(ctx context.Context, arg DeleteRaceResultParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteRaceResult, arg.RaceEventId, arg.UserId)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const deleteRaceResultsByEvent = `-- name: DeleteRaceResultsByEvent :exec
+DELETE FROM "race_result" WHERE "userId"=$1
+ AND "raceEventId" IN (SELECT id FROM "race_event" WHERE "eventId"=$2)
+`
+
+type DeleteRaceResultsByEventParams struct {
+	UserId  string
+	EventId string
+}
+
+// Delete race results by user and event (used by RemoveMemberFromEvent).
+func (q *Queries) DeleteRaceResultsByEvent(ctx context.Context, arg DeleteRaceResultsByEventParams) error {
+	_, err := q.db.ExecContext(ctx, deleteRaceResultsByEvent, arg.UserId, arg.EventId)
+	return err
+}
+
 const eventExists = `-- name: EventExists :one
 SELECT EXISTS(SELECT 1 FROM "event" WHERE id = $1)
 `
@@ -161,6 +399,45 @@ func (q *Queries) GetActiveRaceCountForUser(ctx context.Context, arg GetActiveRa
 	return count, err
 }
 
+const getDatasetByID = `-- name: GetDatasetByID :one
+SELECT id, "eventId", source, rows, status, "importedAt", "createdAt", "updatedAt"
+FROM "dataset" WHERE id = $1 AND "eventId" = $2
+`
+
+type GetDatasetByIDParams struct {
+	ID      string
+	EventId string
+}
+
+// Dataset fetch.
+func (q *Queries) GetDatasetByID(ctx context.Context, arg GetDatasetByIDParams) (Dataset, error) {
+	row := q.db.QueryRowContext(ctx, getDatasetByID, arg.ID, arg.EventId)
+	var i Dataset
+	err := row.Scan(
+		&i.ID,
+		&i.EventId,
+		&i.Source,
+		&i.Rows,
+		&i.Status,
+		&i.ImportedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getEventGranularity = `-- name: GetEventGranularity :one
+SELECT "granularParticipation" FROM "event" WHERE id = $1
+`
+
+// Granularity flag (used by RequireMembershipForResult, ApplyAutoDeferrals).
+func (q *Queries) GetEventGranularity(ctx context.Context, id string) (bool, error) {
+	row := q.db.QueryRowContext(ctx, getEventGranularity, id)
+	var granularParticipation bool
+	err := row.Scan(&granularParticipation)
+	return granularParticipation, err
+}
+
 const getEventMemberCount = `-- name: GetEventMemberCount :one
 SELECT COUNT(*) FROM "event_member" WHERE "eventId" = $1
 `
@@ -171,6 +448,63 @@ func (q *Queries) GetEventMemberCount(ctx context.Context, eventid string) (int6
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const getEventRow = `-- name: GetEventRow :one
+SELECT id, name, description, "ownerType", "organizationId", "ownerUserId", status, tag, "deletedAt", "scoringType", "scoringRulesMode", "customScoringTables", "classRestriction", "granularParticipation", "signupsLocked", "scheduledAt", "participantLimit", "maxConcurrentRaceParticipations", "createdAt", "updatedAt"
+FROM "event" WHERE id = $1
+`
+
+type GetEventRowRow struct {
+	ID                              string
+	Name                            string
+	Description                     sql.NullString
+	OwnerType                       interface{}
+	OrganizationId                  sql.NullString
+	OwnerUserId                     sql.NullString
+	Status                          string
+	Tag                             string
+	DeletedAt                       sql.NullTime
+	ScoringType                     int16
+	ScoringRulesMode                sql.NullString
+	CustomScoringTables             pqtype.NullRawMessage
+	ClassRestriction                interface{}
+	GranularParticipation           bool
+	SignupsLocked                   bool
+	ScheduledAt                     sql.NullTime
+	ParticipantLimit                sql.NullInt32
+	MaxConcurrentRaceParticipations sql.NullInt32
+	CreatedAt                       time.Time
+	UpdatedAt                       time.Time
+}
+
+// Full event row (replaces eventColumns scans).
+func (q *Queries) GetEventRow(ctx context.Context, id string) (GetEventRowRow, error) {
+	row := q.db.QueryRowContext(ctx, getEventRow, id)
+	var i GetEventRowRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Description,
+		&i.OwnerType,
+		&i.OrganizationId,
+		&i.OwnerUserId,
+		&i.Status,
+		&i.Tag,
+		&i.DeletedAt,
+		&i.ScoringType,
+		&i.ScoringRulesMode,
+		&i.CustomScoringTables,
+		&i.ClassRestriction,
+		&i.GranularParticipation,
+		&i.SignupsLocked,
+		&i.ScheduledAt,
+		&i.ParticipantLimit,
+		&i.MaxConcurrentRaceParticipations,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const getEventScheduleByID = `-- name: GetEventScheduleByID :one
@@ -194,16 +528,79 @@ func (q *Queries) GetEventScheduleByID(ctx context.Context, id string) (EventSch
 	return i, err
 }
 
+const getEventScoringRules = `-- name: GetEventScoringRules :one
+SELECT "scoringType", "scoringRulesMode", "customScoringTables" FROM "event" WHERE id = $1
+`
+
+type GetEventScoringRulesRow struct {
+	ScoringType         int16
+	ScoringRulesMode    sql.NullString
+	CustomScoringTables pqtype.NullRawMessage
+}
+
+// Event scoring rules (used by eventScoringRules, ApplyAutoDeferrals).
+func (q *Queries) GetEventScoringRules(ctx context.Context, id string) (GetEventScoringRulesRow, error) {
+	row := q.db.QueryRowContext(ctx, getEventScoringRules, id)
+	var i GetEventScoringRulesRow
+	err := row.Scan(&i.ScoringType, &i.ScoringRulesMode, &i.CustomScoringTables)
+	return i, err
+}
+
+const getEventStatus = `-- name: GetEventStatus :one
+SELECT status FROM "event" WHERE id = $1
+`
+
+// Event status (used by DeleteEvent).
+func (q *Queries) GetEventStatus(ctx context.Context, id string) (string, error) {
+	row := q.db.QueryRowContext(ctx, getEventStatus, id)
+	var status string
+	err := row.Scan(&status)
+	return status, err
+}
+
+const getLadderElo = `-- name: GetLadderElo :one
+SELECT elo FROM "event_ladder_entry" WHERE "eventId" = $1 AND "userId" = $2
+`
+
+type GetLadderEloParams struct {
+	EventId string
+	UserId  string
+}
+
+// Ladder elo lookup (used by getOrCreateLadderElo).
+func (q *Queries) GetLadderElo(ctx context.Context, arg GetLadderEloParams) (int32, error) {
+	row := q.db.QueryRowContext(ctx, getLadderElo, arg.EventId, arg.UserId)
+	var elo int32
+	err := row.Scan(&elo)
+	return elo, err
+}
+
+const getMaxRaceEnrollment = `-- name: GetMaxRaceEnrollment :one
+SELECT COALESCE(MAX(c), 0)::integer FROM (
+   SELECT COUNT(*) AS c FROM "race_event_member" m
+   JOIN "race_event" r ON r.id = m."raceEventId"
+   WHERE r."eventId" = $1 GROUP BY m."userId"
+ ) t
+`
+
+// Max per-user race enrollment (used by UpdateEvent capacity checks).
+func (q *Queries) GetMaxRaceEnrollment(ctx context.Context, eventid string) (int32, error) {
+	row := q.db.QueryRowContext(ctx, getMaxRaceEnrollment, eventid)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const getMaxRaceSequence = `-- name: GetMaxRaceSequence :one
-SELECT MAX(sequence) FROM "race_event" WHERE "eventId" = $1
+SELECT COALESCE(MAX(sequence), 0)::integer FROM "race_event" WHERE "eventId" = $1
 `
 
 // Max sequence for a race event (used by CreateRaceEvent).
-func (q *Queries) GetMaxRaceSequence(ctx context.Context, eventid string) (interface{}, error) {
+func (q *Queries) GetMaxRaceSequence(ctx context.Context, eventid string) (int32, error) {
 	row := q.db.QueryRowContext(ctx, getMaxRaceSequence, eventid)
-	var max interface{}
-	err := row.Scan(&max)
-	return max, err
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const getRaceEventMemberCount = `-- name: GetRaceEventMemberCount :one
@@ -218,6 +615,53 @@ func (q *Queries) GetRaceEventMemberCount(ctx context.Context, raceeventid strin
 	return count, err
 }
 
+const getRaceEventRow = `-- name: GetRaceEventRow :one
+SELECT id, "eventId", name, sequence, "distanceMeters", "trackType", location, "scoringType", grade, "classRestriction", "startsAt", "endsAt", "participantLimit", "createdAt", "updatedAt"
+FROM "race_event" WHERE id = $1
+`
+
+type GetRaceEventRowRow struct {
+	ID               string
+	EventId          string
+	Name             string
+	Sequence         int32
+	DistanceMeters   int32
+	TrackType        string
+	Location         string
+	ScoringType      sql.NullInt16
+	Grade            sql.NullString
+	ClassRestriction interface{}
+	StartsAt         sql.NullTime
+	EndsAt           sql.NullTime
+	ParticipantLimit sql.NullInt32
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// Full race row (replaces raceEventColumns scans).
+func (q *Queries) GetRaceEventRow(ctx context.Context, id string) (GetRaceEventRowRow, error) {
+	row := q.db.QueryRowContext(ctx, getRaceEventRow, id)
+	var i GetRaceEventRowRow
+	err := row.Scan(
+		&i.ID,
+		&i.EventId,
+		&i.Name,
+		&i.Sequence,
+		&i.DistanceMeters,
+		&i.TrackType,
+		&i.Location,
+		&i.ScoringType,
+		&i.Grade,
+		&i.ClassRestriction,
+		&i.StartsAt,
+		&i.EndsAt,
+		&i.ParticipantLimit,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getUserClassTier = `-- name: GetUserClassTier :one
 SELECT "classTier" FROM "user" WHERE id = $1
 `
@@ -228,6 +672,52 @@ func (q *Queries) GetUserClassTier(ctx context.Context, id string) (interface{},
 	var classTier interface{}
 	err := row.Scan(&classTier)
 	return classTier, err
+}
+
+const insertDeferredResult = `-- name: InsertDeferredResult :exec
+INSERT INTO "race_result" (id, "raceEventId", "userId", points, "resultStatus", "createdAt", "updatedAt")
+VALUES ($1, $2, $3, 0, 'DEFERRED', $4, $4)
+`
+
+type InsertDeferredResultParams struct {
+	ID          string
+	RaceEventId string
+	UserId      string
+	CreatedAt   time.Time
+}
+
+// Deferred result insert.
+func (q *Queries) InsertDeferredResult(ctx context.Context, arg InsertDeferredResultParams) error {
+	_, err := q.db.ExecContext(ctx, insertDeferredResult,
+		arg.ID,
+		arg.RaceEventId,
+		arg.UserId,
+		arg.CreatedAt,
+	)
+	return err
+}
+
+const insertEventAdmin = `-- name: InsertEventAdmin :exec
+INSERT INTO "event_admin" (id, "eventId", "userId", "createdAt")
+VALUES ($1, $2, $3, $4) ON CONFLICT ("eventId", "userId") DO NOTHING
+`
+
+type InsertEventAdminParams struct {
+	ID        string
+	EventId   string
+	UserId    string
+	CreatedAt time.Time
+}
+
+// Event admin add (idempotent) / remove.
+func (q *Queries) InsertEventAdmin(ctx context.Context, arg InsertEventAdminParams) error {
+	_, err := q.db.ExecContext(ctx, insertEventAdmin,
+		arg.ID,
+		arg.EventId,
+		arg.UserId,
+		arg.CreatedAt,
+	)
+	return err
 }
 
 const insertEventMember = `-- name: InsertEventMember :exec
@@ -250,6 +740,22 @@ func (q *Queries) InsertEventMember(ctx context.Context, arg InsertEventMemberPa
 		arg.UserId,
 		arg.CreatedAt,
 	)
+	return err
+}
+
+const insertEventMemberSimple = `-- name: InsertEventMemberSimple :exec
+INSERT INTO "event_member" (id, "eventId", "userId") VALUES ($1, $2, $3)
+`
+
+type InsertEventMemberSimpleParams struct {
+	ID      string
+	EventId string
+	UserId  string
+}
+
+// Event member insert without timestamp (used by JoinRaceEvent auto-join).
+func (q *Queries) InsertEventMemberSimple(ctx context.Context, arg InsertEventMemberSimpleParams) error {
+	_, err := q.db.ExecContext(ctx, insertEventMemberSimple, arg.ID, arg.EventId, arg.UserId)
 	return err
 }
 
@@ -277,6 +783,77 @@ func (q *Queries) InsertEventSchedule(ctx context.Context, arg InsertEventSchedu
 		arg.StartsAt,
 		arg.EndsAt,
 		arg.Location,
+		arg.CreatedAt,
+	)
+	return err
+}
+
+const insertLadderEntry = `-- name: InsertLadderEntry :exec
+INSERT INTO "event_ladder_entry" (id, "eventId", "userId", elo, "createdAt")
+VALUES ($1, $2, $3, 1200, $4)
+ON CONFLICT ("eventId", "userId") DO NOTHING
+`
+
+type InsertLadderEntryParams struct {
+	ID        string
+	EventId   string
+	UserId    string
+	CreatedAt time.Time
+}
+
+// Ladder entry insert (1200 default, idempotent).
+func (q *Queries) InsertLadderEntry(ctx context.Context, arg InsertLadderEntryParams) error {
+	_, err := q.db.ExecContext(ctx, insertLadderEntry,
+		arg.ID,
+		arg.EventId,
+		arg.UserId,
+		arg.CreatedAt,
+	)
+	return err
+}
+
+const insertLadderStandingsRow = `-- name: InsertLadderStandingsRow :exec
+INSERT INTO "event_ladder_entry" (id, "eventId", "userId", elo, "createdAt", "updatedAt")
+VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT ("eventId", "userId") DO NOTHING
+`
+
+type InsertLadderStandingsRowParams struct {
+	ID        string
+	EventId   string
+	UserId    string
+	Elo       int32
+	CreatedAt time.Time
+}
+
+func (q *Queries) InsertLadderStandingsRow(ctx context.Context, arg InsertLadderStandingsRowParams) error {
+	_, err := q.db.ExecContext(ctx, insertLadderStandingsRow,
+		arg.ID,
+		arg.EventId,
+		arg.UserId,
+		arg.Elo,
+		arg.CreatedAt,
+	)
+	return err
+}
+
+const insertPointsStandingsRow = `-- name: InsertPointsStandingsRow :exec
+INSERT INTO "event_points_entry" (id, "eventId", "userId", points, "createdAt", "updatedAt")
+VALUES ($1, $2, $3, 0, $4, $4) ON CONFLICT ("eventId", "userId") DO NOTHING
+`
+
+type InsertPointsStandingsRowParams struct {
+	ID        string
+	EventId   string
+	UserId    string
+	CreatedAt time.Time
+}
+
+// Standings seed rows (used by EnsureEventStandingsRow).
+func (q *Queries) InsertPointsStandingsRow(ctx context.Context, arg InsertPointsStandingsRowParams) error {
+	_, err := q.db.ExecContext(ctx, insertPointsStandingsRow,
+		arg.ID,
+		arg.EventId,
+		arg.UserId,
 		arg.CreatedAt,
 	)
 	return err
@@ -329,6 +906,661 @@ func (q *Queries) InsertRaceEvent(ctx context.Context, arg InsertRaceEventParams
 	return err
 }
 
+const insertRaceEventMember = `-- name: InsertRaceEventMember :exec
+INSERT INTO "race_event_member" (id, "raceEventId", "userId") VALUES ($1, $2, $3)
+`
+
+type InsertRaceEventMemberParams struct {
+	ID          string
+	RaceEventId string
+	UserId      string
+}
+
+// Race event member insert (used by Add/JoinRaceEventMember).
+func (q *Queries) InsertRaceEventMember(ctx context.Context, arg InsertRaceEventMemberParams) error {
+	_, err := q.db.ExecContext(ctx, insertRaceEventMember, arg.ID, arg.RaceEventId, arg.UserId)
+	return err
+}
+
+const listAutoDeferralInputs = `-- name: ListAutoDeferralInputs :many
+SELECT res.id, res."raceEventId", r.grade, res."userId", res.position,
+       res.points, res."resultStatus", u."classTier"
+FROM "race_result" res
+JOIN "race_event" r ON r.id = res."raceEventId"
+JOIN "user" u ON u.id = res."userId"
+WHERE r."eventId" = $1
+`
+
+type ListAutoDeferralInputsRow struct {
+	ID           string
+	RaceEventId  string
+	Grade        sql.NullString
+	UserId       string
+	Position     sql.NullInt32
+	Points       int32
+	ResultStatus sql.NullString
+	ClassTier    interface{}
+}
+
+// Auto-deferral source rows.
+func (q *Queries) ListAutoDeferralInputs(ctx context.Context, eventid string) ([]ListAutoDeferralInputsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listAutoDeferralInputs, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAutoDeferralInputsRow
+	for rows.Next() {
+		var i ListAutoDeferralInputsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RaceEventId,
+			&i.Grade,
+			&i.UserId,
+			&i.Position,
+			&i.Points,
+			&i.ResultStatus,
+			&i.ClassTier,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDatasetsByEvent = `-- name: ListDatasetsByEvent :many
+SELECT id, "eventId", source, rows, status, "importedAt", "createdAt", "updatedAt"
+FROM "dataset" WHERE "eventId" = $1 ORDER BY "createdAt" DESC
+`
+
+// Datasets scoped by event.
+func (q *Queries) ListDatasetsByEvent(ctx context.Context, eventid string) ([]Dataset, error) {
+	rows, err := q.db.QueryContext(ctx, listDatasetsByEvent, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Dataset
+	for rows.Next() {
+		var i Dataset
+		if err := rows.Scan(
+			&i.ID,
+			&i.EventId,
+			&i.Source,
+			&i.Rows,
+			&i.Status,
+			&i.ImportedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEligibleEvents = `-- name: ListEligibleEvents :many
+SELECT id, name, "organizationId", "classRestriction" FROM "event" ORDER BY "createdAt" DESC
+`
+
+type ListEligibleEventsRow struct {
+	ID               string
+	Name             string
+	OrganizationId   sql.NullString
+	ClassRestriction interface{}
+}
+
+// Eligible events listing (used by ListEligibleEvents).
+func (q *Queries) ListEligibleEvents(ctx context.Context) ([]ListEligibleEventsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listEligibleEvents)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEligibleEventsRow
+	for rows.Next() {
+		var i ListEligibleEventsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.OrganizationId,
+			&i.ClassRestriction,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEligibleRaces = `-- name: ListEligibleRaces :many
+SELECT id, name, sequence, grade, "classRestriction" FROM "race_event" WHERE "eventId" = $1 ORDER BY sequence ASC
+`
+
+type ListEligibleRacesRow struct {
+	ID               string
+	Name             string
+	Sequence         int32
+	Grade            sql.NullString
+	ClassRestriction interface{}
+}
+
+// Eligible races for one event (used by ListEligibleEvents).
+func (q *Queries) ListEligibleRaces(ctx context.Context, eventid string) ([]ListEligibleRacesRow, error) {
+	rows, err := q.db.QueryContext(ctx, listEligibleRaces, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEligibleRacesRow
+	for rows.Next() {
+		var i ListEligibleRacesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Sequence,
+			&i.Grade,
+			&i.ClassRestriction,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEventAdmins = `-- name: ListEventAdmins :many
+SELECT a."userId", COALESCE(u."vrchatUsername", u.name)
+FROM "event_admin" a JOIN "user" u ON u.id = a."userId"
+WHERE a."eventId" = $1
+`
+
+type ListEventAdminsRow struct {
+	UserId         string
+	VrchatUsername string
+}
+
+// Event administrators with display names.
+func (q *Queries) ListEventAdmins(ctx context.Context, eventid string) ([]ListEventAdminsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listEventAdmins, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEventAdminsRow
+	for rows.Next() {
+		var i ListEventAdminsRow
+		if err := rows.Scan(&i.UserId, &i.VrchatUsername); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEventMemberIDs = `-- name: ListEventMemberIDs :many
+SELECT "userId" FROM "event_member" WHERE "eventId" = $1
+`
+
+// Event member ids (used by ApplyAutoDeferrals).
+func (q *Queries) ListEventMemberIDs(ctx context.Context, eventid string) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, listEventMemberIDs, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var userId string
+		if err := rows.Scan(&userId); err != nil {
+			return nil, err
+		}
+		items = append(items, userId)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEventMembersByEvent = `-- name: ListEventMembersByEvent :many
+SELECT m."userId", COALESCE(u."vrchatUsername", u.name), u."classTier"
+FROM "event_member" m JOIN "user" u ON u.id = m."userId"
+WHERE m."eventId" = $1
+`
+
+type ListEventMembersByEventRow struct {
+	UserId         string
+	VrchatUsername string
+	ClassTier      interface{}
+}
+
+// Event members with display names (used by LoadEvent).
+func (q *Queries) ListEventMembersByEvent(ctx context.Context, eventid string) ([]ListEventMembersByEventRow, error) {
+	rows, err := q.db.QueryContext(ctx, listEventMembersByEvent, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEventMembersByEventRow
+	for rows.Next() {
+		var i ListEventMembersByEventRow
+		if err := rows.Scan(&i.UserId, &i.VrchatUsername, &i.ClassTier); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEventRaces = `-- name: ListEventRaces :many
+SELECT id, name, sequence, "distanceMeters", "trackType", location, "scoringType", grade, "classRestriction", "startsAt", "endsAt", "participantLimit"
+FROM "race_event" WHERE "eventId" = $1 ORDER BY sequence ASC
+`
+
+type ListEventRacesRow struct {
+	ID               string
+	Name             string
+	Sequence         int32
+	DistanceMeters   int32
+	TrackType        string
+	Location         string
+	ScoringType      sql.NullInt16
+	Grade            sql.NullString
+	ClassRestriction interface{}
+	StartsAt         sql.NullTime
+	EndsAt           sql.NullTime
+	ParticipantLimit sql.NullInt32
+}
+
+// Races of an event for LoadEvent.
+func (q *Queries) ListEventRaces(ctx context.Context, eventid string) ([]ListEventRacesRow, error) {
+	rows, err := q.db.QueryContext(ctx, listEventRaces, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEventRacesRow
+	for rows.Next() {
+		var i ListEventRacesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Sequence,
+			&i.DistanceMeters,
+			&i.TrackType,
+			&i.Location,
+			&i.ScoringType,
+			&i.Grade,
+			&i.ClassRestriction,
+			&i.StartsAt,
+			&i.EndsAt,
+			&i.ParticipantLimit,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEventSchedules = `-- name: ListEventSchedules :many
+SELECT id, title, "startsAt", "endsAt", location FROM "event_schedule"
+WHERE "eventId" = $1 ORDER BY "startsAt" ASC
+`
+
+type ListEventSchedulesRow struct {
+	ID       string
+	Title    sql.NullString
+	StartsAt time.Time
+	EndsAt   sql.NullTime
+	Location sql.NullString
+}
+
+// Schedules of an event (used by LoadEvent).
+func (q *Queries) ListEventSchedules(ctx context.Context, eventid string) ([]ListEventSchedulesRow, error) {
+	rows, err := q.db.QueryContext(ctx, listEventSchedules, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEventSchedulesRow
+	for rows.Next() {
+		var i ListEventSchedulesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.StartsAt,
+			&i.EndsAt,
+			&i.Location,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEvents = `-- name: ListEvents :many
+SELECT e.id, e.name, e.description, e."ownerType", e."organizationId", e."ownerUserId",
+e.status, e.tag, e."deletedAt", e."scoringType", e."classRestriction", e."granularParticipation",
+e."signupsLocked", e."scheduledAt", e."participantLimit", e."maxConcurrentRaceParticipations",
+e."createdAt", e."updatedAt",
+(SELECT COUNT(*) FROM "race_event" r WHERE r."eventId" = e.id),
+(SELECT COUNT(*) FROM "event_member" m WHERE m."eventId" = e.id)
+FROM "event" e
+WHERE ($1::text = '' OR e."organizationId" = $1)
+  AND ($2::text = '' OR e."classRestriction"::text = $2)
+  AND ($3::text = '' OR e.tag = $3)
+  AND ($4::text = '' OR e.status = $4)
+  AND ($4::text != '' OR $5::boolean OR e.status != 'PENDING_DELETION')
+ORDER BY e."createdAt" DESC
+LIMIT NULLIF($6::int, 0) OFFSET $7::int
+`
+
+type ListEventsParams struct {
+	Column1 string
+	Column2 string
+	Column3 string
+	Column4 string
+	Column5 bool
+	Column6 int32
+	Column7 int32
+}
+
+type ListEventsRow struct {
+	ID                              string
+	Name                            string
+	Description                     sql.NullString
+	OwnerType                       interface{}
+	OrganizationId                  sql.NullString
+	OwnerUserId                     sql.NullString
+	Status                          string
+	Tag                             string
+	DeletedAt                       sql.NullTime
+	ScoringType                     int16
+	ClassRestriction                interface{}
+	GranularParticipation           bool
+	SignupsLocked                   bool
+	ScheduledAt                     sql.NullTime
+	ParticipantLimit                sql.NullInt32
+	MaxConcurrentRaceParticipations sql.NullInt32
+	CreatedAt                       time.Time
+	UpdatedAt                       time.Time
+	Count                           int64
+	Count_2                         int64
+}
+
+// Event list page with optional filters (empty means absent).
+func (q *Queries) ListEvents(ctx context.Context, arg ListEventsParams) ([]ListEventsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listEvents,
+		arg.Column1,
+		arg.Column2,
+		arg.Column3,
+		arg.Column4,
+		arg.Column5,
+		arg.Column6,
+		arg.Column7,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEventsRow
+	for rows.Next() {
+		var i ListEventsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Description,
+			&i.OwnerType,
+			&i.OrganizationId,
+			&i.OwnerUserId,
+			&i.Status,
+			&i.Tag,
+			&i.DeletedAt,
+			&i.ScoringType,
+			&i.ClassRestriction,
+			&i.GranularParticipation,
+			&i.SignupsLocked,
+			&i.ScheduledAt,
+			&i.ParticipantLimit,
+			&i.MaxConcurrentRaceParticipations,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Count,
+			&i.Count_2,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLadderOverview = `-- name: ListLadderOverview :many
+SELECT e."userId", COALESCE(u."vrchatUsername", u.name), e.elo, e.wins, e.losses
+FROM "event_ladder_entry" e JOIN "user" u ON u.id = e."userId"
+WHERE e."eventId" = $1 ORDER BY e.elo DESC
+`
+
+type ListLadderOverviewRow struct {
+	UserId         string
+	VrchatUsername string
+	Elo            int32
+	Wins           int32
+	Losses         int32
+}
+
+func (q *Queries) ListLadderOverview(ctx context.Context, eventid string) ([]ListLadderOverviewRow, error) {
+	rows, err := q.db.QueryContext(ctx, listLadderOverview, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLadderOverviewRow
+	for rows.Next() {
+		var i ListLadderOverviewRow
+		if err := rows.Scan(
+			&i.UserId,
+			&i.VrchatUsername,
+			&i.Elo,
+			&i.Wins,
+			&i.Losses,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPointsOverview = `-- name: ListPointsOverview :many
+SELECT e."userId", COALESCE(u."vrchatUsername", u.name), e.points
+FROM "event_points_entry" e JOIN "user" u ON u.id = e."userId"
+WHERE e."eventId" = $1 ORDER BY e.points DESC
+`
+
+type ListPointsOverviewRow struct {
+	UserId         string
+	VrchatUsername string
+	Points         int32
+}
+
+// Scoring overviews (used by LoadEvent).
+func (q *Queries) ListPointsOverview(ctx context.Context, eventid string) ([]ListPointsOverviewRow, error) {
+	rows, err := q.db.QueryContext(ctx, listPointsOverview, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPointsOverviewRow
+	for rows.Next() {
+		var i ListPointsOverviewRow
+		if err := rows.Scan(&i.UserId, &i.VrchatUsername, &i.Points); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPublicEvents = `-- name: ListPublicEvents :many
+SELECT e.id, e.name, e.description, e."ownerType", e."organizationId", e."ownerUserId",
+e.status, e.tag, e."deletedAt", e."scoringType", e."classRestriction", e."granularParticipation",
+e."signupsLocked", e."scheduledAt", e."participantLimit", e."maxConcurrentRaceParticipations",
+e."createdAt", e."updatedAt",
+(SELECT COUNT(*) FROM "race_event" r WHERE r."eventId" = e.id),
+(SELECT COUNT(*) FROM "event_member" m WHERE m."eventId" = e.id)
+FROM "event" e
+WHERE e.status IN ('PENDING','ONGOING','CONCLUDED')
+ORDER BY e."createdAt" DESC LIMIT $1::int OFFSET $2::int
+`
+
+type ListPublicEventsParams struct {
+	Column1 int32
+	Column2 int32
+}
+
+type ListPublicEventsRow struct {
+	ID                              string
+	Name                            string
+	Description                     sql.NullString
+	OwnerType                       interface{}
+	OrganizationId                  sql.NullString
+	OwnerUserId                     sql.NullString
+	Status                          string
+	Tag                             string
+	DeletedAt                       sql.NullTime
+	ScoringType                     int16
+	ClassRestriction                interface{}
+	GranularParticipation           bool
+	SignupsLocked                   bool
+	ScheduledAt                     sql.NullTime
+	ParticipantLimit                sql.NullInt32
+	MaxConcurrentRaceParticipations sql.NullInt32
+	CreatedAt                       time.Time
+	UpdatedAt                       time.Time
+	Count                           int64
+	Count_2                         int64
+}
+
+// Public event list page.
+func (q *Queries) ListPublicEvents(ctx context.Context, arg ListPublicEventsParams) ([]ListPublicEventsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listPublicEvents, arg.Column1, arg.Column2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPublicEventsRow
+	for rows.Next() {
+		var i ListPublicEventsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Description,
+			&i.OwnerType,
+			&i.OrganizationId,
+			&i.OwnerUserId,
+			&i.Status,
+			&i.Tag,
+			&i.DeletedAt,
+			&i.ScoringType,
+			&i.ClassRestriction,
+			&i.GranularParticipation,
+			&i.SignupsLocked,
+			&i.ScheduledAt,
+			&i.ParticipantLimit,
+			&i.MaxConcurrentRaceParticipations,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Count,
+			&i.Count_2,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRaceEventMembers = `-- name: ListRaceEventMembers :many
 SELECT m."userId", COALESCE(u."vrchatUsername", u.name), u."classTier"
 FROM "race_event_member" m JOIN "user" u ON u.id = m."userId"
@@ -365,6 +1597,375 @@ func (q *Queries) ListRaceEventMembers(ctx context.Context, raceeventid string) 
 	return items, nil
 }
 
+const listRaceEventRows = `-- name: ListRaceEventRows :many
+SELECT id, "eventId", name, sequence, "distanceMeters", "trackType", location, "scoringType", grade, "classRestriction", "startsAt", "endsAt", "participantLimit", "createdAt", "updatedAt"
+FROM "race_event" WHERE "eventId" = $1 ORDER BY sequence ASC
+`
+
+type ListRaceEventRowsRow struct {
+	ID               string
+	EventId          string
+	Name             string
+	Sequence         int32
+	DistanceMeters   int32
+	TrackType        string
+	Location         string
+	ScoringType      sql.NullInt16
+	Grade            sql.NullString
+	ClassRestriction interface{}
+	StartsAt         sql.NullTime
+	EndsAt           sql.NullTime
+	ParticipantLimit sql.NullInt32
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// Full race rows of an event (used by ListRaceEventsCore).
+func (q *Queries) ListRaceEventRows(ctx context.Context, eventid string) ([]ListRaceEventRowsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listRaceEventRows, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListRaceEventRowsRow
+	for rows.Next() {
+		var i ListRaceEventRowsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.EventId,
+			&i.Name,
+			&i.Sequence,
+			&i.DistanceMeters,
+			&i.TrackType,
+			&i.Location,
+			&i.ScoringType,
+			&i.Grade,
+			&i.ClassRestriction,
+			&i.StartsAt,
+			&i.EndsAt,
+			&i.ParticipantLimit,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRaceIDSequences = `-- name: ListRaceIDSequences :many
+SELECT id, sequence FROM "race_event" WHERE "eventId" = $1 ORDER BY sequence ASC
+`
+
+type ListRaceIDSequencesRow struct {
+	ID       string
+	Sequence int32
+}
+
+// Race id + sequence list (used by ReorderRaceEvents).
+func (q *Queries) ListRaceIDSequences(ctx context.Context, eventid string) ([]ListRaceIDSequencesRow, error) {
+	rows, err := q.db.QueryContext(ctx, listRaceIDSequences, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListRaceIDSequencesRow
+	for rows.Next() {
+		var i ListRaceIDSequencesRow
+		if err := rows.Scan(&i.ID, &i.Sequence); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRaceIDs = `-- name: ListRaceIDs :many
+SELECT id FROM "race_event" WHERE "eventId" = $1
+`
+
+// Race ids for an event.
+func (q *Queries) ListRaceIDs(ctx context.Context, eventid string) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, listRaceIDs, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRaceMemberPairs = `-- name: ListRaceMemberPairs :many
+SELECT m."raceEventId", m."userId" FROM "race_event_member" m
+JOIN "race_event" r ON r.id = m."raceEventId" WHERE r."eventId" = $1
+`
+
+type ListRaceMemberPairsRow struct {
+	RaceEventId string
+	UserId      string
+}
+
+// Race member pairs for an event (used by ApplyAutoDeferrals).
+func (q *Queries) ListRaceMemberPairs(ctx context.Context, eventid string) ([]ListRaceMemberPairsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listRaceMemberPairs, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListRaceMemberPairsRow
+	for rows.Next() {
+		var i ListRaceMemberPairsRow
+		if err := rows.Scan(&i.RaceEventId, &i.UserId); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRaceMembersByEvent = `-- name: ListRaceMembersByEvent :many
+SELECT m."raceEventId", m."userId", COALESCE(u."vrchatUsername", u.name), u."classTier"
+FROM "race_event_member" m
+JOIN "race_event" r ON r.id = m."raceEventId"
+JOIN "user" u ON u.id = m."userId"
+WHERE r."eventId" = $1
+`
+
+type ListRaceMembersByEventRow struct {
+	RaceEventId    string
+	UserId         string
+	VrchatUsername string
+	ClassTier      interface{}
+}
+
+// Race members of an event with display names (used by LoadEvent).
+func (q *Queries) ListRaceMembersByEvent(ctx context.Context, eventid string) ([]ListRaceMembersByEventRow, error) {
+	rows, err := q.db.QueryContext(ctx, listRaceMembersByEvent, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListRaceMembersByEventRow
+	for rows.Next() {
+		var i ListRaceMembersByEventRow
+		if err := rows.Scan(
+			&i.RaceEventId,
+			&i.UserId,
+			&i.VrchatUsername,
+			&i.ClassTier,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRaceResults = `-- name: ListRaceResults :many
+SELECT id, "raceEventId", "userId", position, points, "gateNumber", "finishTime",
+       margin, "passingOrder", "final3F", "resultStatus", "createdAt", "updatedAt"
+FROM "race_result" WHERE "raceEventId" = $1
+ORDER BY position ASC NULLS LAST, points DESC
+`
+
+type ListRaceResultsRow struct {
+	ID           string
+	RaceEventId  string
+	UserId       string
+	Position     sql.NullInt32
+	Points       int32
+	GateNumber   sql.NullInt16
+	FinishTime   sql.NullString
+	Margin       sql.NullString
+	PassingOrder sql.NullString
+	Final3F      sql.NullString
+	ResultStatus sql.NullString
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// Race result list for one race.
+func (q *Queries) ListRaceResults(ctx context.Context, raceeventid string) ([]ListRaceResultsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listRaceResults, raceeventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListRaceResultsRow
+	for rows.Next() {
+		var i ListRaceResultsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RaceEventId,
+			&i.UserId,
+			&i.Position,
+			&i.Points,
+			&i.GateNumber,
+			&i.FinishTime,
+			&i.Margin,
+			&i.PassingOrder,
+			&i.Final3F,
+			&i.ResultStatus,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listResultUserIDs = `-- name: ListResultUserIDs :many
+SELECT "userId" FROM "race_result" WHERE "raceEventId" = $1
+`
+
+// Result holder ids for a race (used by removedResultUsers).
+func (q *Queries) ListResultUserIDs(ctx context.Context, raceeventid string) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, listResultUserIDs, raceeventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var userId string
+		if err := rows.Scan(&userId); err != nil {
+			return nil, err
+		}
+		items = append(items, userId)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listStoredResultRows = `-- name: ListStoredResultRows :many
+SELECT res.id, res."userId", res.position, res.points, res."resultStatus", r.grade
+FROM "race_result" res JOIN "race_event" r ON r.id = res."raceEventId"
+WHERE r."eventId" = $1
+`
+
+type ListStoredResultRowsRow struct {
+	ID           string
+	UserId       string
+	Position     sql.NullInt32
+	Points       int32
+	ResultStatus sql.NullString
+	Grade        sql.NullString
+}
+
+// Stored result rows for points recomputation.
+func (q *Queries) ListStoredResultRows(ctx context.Context, eventid string) ([]ListStoredResultRowsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listStoredResultRows, eventid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListStoredResultRowsRow
+	for rows.Next() {
+		var i ListStoredResultRowsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserId,
+			&i.Position,
+			&i.Points,
+			&i.ResultStatus,
+			&i.Grade,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const markResultDeferred = `-- name: MarkResultDeferred :exec
+UPDATE "race_result" SET "resultStatus" = 'DEFERRED', points = 0 WHERE id = $1
+`
+
+// Deferred result mark.
+func (q *Queries) MarkResultDeferred(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, markResultDeferred, id)
+	return err
+}
+
+const orgExists = `-- name: OrgExists :one
+SELECT EXISTS(SELECT 1 FROM "organization" WHERE id = $1)
+`
+
+// Organization exists check (used by CreateEvent).
+func (q *Queries) OrgExists(ctx context.Context, id string) (bool, error) {
+	row := q.db.QueryRowContext(ctx, orgExists, id)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const purgeExpiredDeletedEvents = `-- name: PurgeExpiredDeletedEvents :exec
+DELETE FROM "event" WHERE status = 'PENDING_DELETION' AND "deletedAt" <= $1
+`
+
+// Purge long-deleted events.
+func (q *Queries) PurgeExpiredDeletedEvents(ctx context.Context, deletedat sql.NullTime) error {
+	_, err := q.db.ExecContext(ctx, purgeExpiredDeletedEvents, deletedat)
+	return err
+}
+
 const raceEventMemberExists = `-- name: RaceEventMemberExists :one
 SELECT EXISTS(SELECT 1 FROM "event_member" WHERE "eventId"=$1 AND "userId"=$2)
 `
@@ -382,6 +1983,182 @@ func (q *Queries) RaceEventMemberExists(ctx context.Context, arg RaceEventMember
 	return exists, err
 }
 
+const raceMemberExists = `-- name: RaceMemberExists :one
+SELECT EXISTS(SELECT 1 FROM "race_event_member" WHERE "raceEventId" = $1 AND "userId" = $2)
+`
+
+type RaceMemberExistsParams struct {
+	RaceEventId string
+	UserId      string
+}
+
+// Race member exists check (used by RequireMembershipForResult).
+func (q *Queries) RaceMemberExists(ctx context.Context, arg RaceMemberExistsParams) (bool, error) {
+	row := q.db.QueryRowContext(ctx, raceMemberExists, arg.RaceEventId, arg.UserId)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const recordLadderLoss = `-- name: RecordLadderLoss :exec
+UPDATE "event_ladder_entry" SET elo = $1, losses = losses + 1 WHERE "eventId" = $2 AND "userId" = $3
+`
+
+type RecordLadderLossParams struct {
+	Elo     int32
+	EventId string
+	UserId  string
+}
+
+func (q *Queries) RecordLadderLoss(ctx context.Context, arg RecordLadderLossParams) error {
+	_, err := q.db.ExecContext(ctx, recordLadderLoss, arg.Elo, arg.EventId, arg.UserId)
+	return err
+}
+
+const recordLadderWin = `-- name: RecordLadderWin :exec
+UPDATE "event_ladder_entry" SET elo = $1, wins = wins + 1 WHERE "eventId" = $2 AND "userId" = $3
+`
+
+type RecordLadderWinParams struct {
+	Elo     int32
+	EventId string
+	UserId  string
+}
+
+// Ladder match result updates.
+func (q *Queries) RecordLadderWin(ctx context.Context, arg RecordLadderWinParams) error {
+	_, err := q.db.ExecContext(ctx, recordLadderWin, arg.Elo, arg.EventId, arg.UserId)
+	return err
+}
+
+const restoreDeferredResult = `-- name: RestoreDeferredResult :exec
+UPDATE "race_result" SET "resultStatus" = NULL, points = $1 WHERE id = $2
+`
+
+type RestoreDeferredResultParams struct {
+	Points int32
+	ID     string
+}
+
+// Deferred result restore.
+func (q *Queries) RestoreDeferredResult(ctx context.Context, arg RestoreDeferredResultParams) error {
+	_, err := q.db.ExecContext(ctx, restoreDeferredResult, arg.Points, arg.ID)
+	return err
+}
+
+const restoreEventStatus = `-- name: RestoreEventStatus :exec
+UPDATE "event" SET status = 'PENDING', "deletedAt" = NULL WHERE id = $1
+`
+
+func (q *Queries) RestoreEventStatus(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, restoreEventStatus, id)
+	return err
+}
+
+const softDeleteEvent = `-- name: SoftDeleteEvent :exec
+UPDATE "event" SET status = 'PENDING_DELETION', "deletedAt" = $1 WHERE id = $2
+`
+
+type SoftDeleteEventParams struct {
+	DeletedAt sql.NullTime
+	ID        string
+}
+
+func (q *Queries) SoftDeleteEvent(ctx context.Context, arg SoftDeleteEventParams) error {
+	_, err := q.db.ExecContext(ctx, softDeleteEvent, arg.DeletedAt, arg.ID)
+	return err
+}
+
+const updateDatasetStatus = `-- name: UpdateDatasetStatus :one
+UPDATE "dataset" SET status = $1, "importedAt" = $2 WHERE id = $3
+RETURNING id, "eventId", source, rows, status, "importedAt", "createdAt", "updatedAt"
+`
+
+type UpdateDatasetStatusParams struct {
+	Status     interface{}
+	ImportedAt sql.NullTime
+	ID         string
+}
+
+// Dataset status update with RETURNING.
+func (q *Queries) UpdateDatasetStatus(ctx context.Context, arg UpdateDatasetStatusParams) (Dataset, error) {
+	row := q.db.QueryRowContext(ctx, updateDatasetStatus, arg.Status, arg.ImportedAt, arg.ID)
+	var i Dataset
+	err := row.Scan(
+		&i.ID,
+		&i.EventId,
+		&i.Source,
+		&i.Rows,
+		&i.Status,
+		&i.ImportedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateEvent = `-- name: UpdateEvent :exec
+UPDATE "event" SET
+  "updatedAt" = $1,
+  name = COALESCE($2, name),
+  tag = COALESCE($3, tag),
+  description = CASE WHEN $4::boolean THEN $5 ELSE description END,
+  "scoringRulesMode" = COALESCE($6, "scoringRulesMode"),
+  "customScoringTables" = CASE WHEN $7::boolean THEN NULL WHEN $8::boolean THEN $9 ELSE "customScoringTables" END,
+  "classRestriction" = CASE WHEN $10::boolean THEN $11 ELSE "classRestriction" END,
+  "scheduledAt" = CASE WHEN $12::boolean THEN $13 ELSE "scheduledAt" END,
+  "participantLimit" = CASE WHEN $14::boolean THEN NULL ELSE COALESCE($15, "participantLimit") END,
+  "maxConcurrentRaceParticipations" = CASE WHEN $16::boolean THEN NULL ELSE COALESCE($17, "maxConcurrentRaceParticipations") END
+WHERE id = $18
+`
+
+type UpdateEventParams struct {
+	UpdatedAt time.Time
+	Name      sql.NullString
+	Tag       sql.NullString
+	DescSet   bool
+	DescVal   sql.NullString
+	Mode      sql.NullString
+	CtClear   bool
+	CtSet     bool
+	CtVal     pqtype.NullRawMessage
+	ClassSet  bool
+	ClassVal  interface{}
+	SchedSet  bool
+	SchedVal  sql.NullTime
+	PlClear   bool
+	PlVal     sql.NullInt32
+	McClear   bool
+	McVal     sql.NullInt32
+	ID        string
+}
+
+// Event update: tri-state columns use (clear, set, value) so explicit-null
+// clearing survives without dynamic SQL. Plain optional columns use COALESCE.
+func (q *Queries) UpdateEvent(ctx context.Context, arg UpdateEventParams) error {
+	_, err := q.db.ExecContext(ctx, updateEvent,
+		arg.UpdatedAt,
+		arg.Name,
+		arg.Tag,
+		arg.DescSet,
+		arg.DescVal,
+		arg.Mode,
+		arg.CtClear,
+		arg.CtSet,
+		arg.CtVal,
+		arg.ClassSet,
+		arg.ClassVal,
+		arg.SchedSet,
+		arg.SchedVal,
+		arg.PlClear,
+		arg.PlVal,
+		arg.McClear,
+		arg.McVal,
+		arg.ID,
+	)
+	return err
+}
+
 const updateEventSignupsLocked = `-- name: UpdateEventSignupsLocked :exec
 UPDATE "event" SET "signupsLocked" = $1, "updatedAt" = $2 WHERE id = $3
 `
@@ -395,6 +2172,51 @@ type UpdateEventSignupsLockedParams struct {
 // Signups lock update.
 func (q *Queries) UpdateEventSignupsLocked(ctx context.Context, arg UpdateEventSignupsLockedParams) error {
 	_, err := q.db.ExecContext(ctx, updateEventSignupsLocked, arg.SignupsLocked, arg.UpdatedAt, arg.ID)
+	return err
+}
+
+const updateEventStatus = `-- name: UpdateEventStatus :exec
+UPDATE "event" SET status = $1, "deletedAt" = NULL WHERE id = $2
+`
+
+type UpdateEventStatusParams struct {
+	Status string
+	ID     string
+}
+
+func (q *Queries) UpdateEventStatus(ctx context.Context, arg UpdateEventStatusParams) error {
+	_, err := q.db.ExecContext(ctx, updateEventStatus, arg.Status, arg.ID)
+	return err
+}
+
+const updateEventStatusWithDeletion = `-- name: UpdateEventStatusWithDeletion :exec
+UPDATE "event" SET status = $1, "deletedAt" = $2 WHERE id = $3
+`
+
+type UpdateEventStatusWithDeletionParams struct {
+	Status    string
+	DeletedAt sql.NullTime
+	ID        string
+}
+
+// Event status updates (with/without soft-deletion timestamp).
+func (q *Queries) UpdateEventStatusWithDeletion(ctx context.Context, arg UpdateEventStatusWithDeletionParams) error {
+	_, err := q.db.ExecContext(ctx, updateEventStatusWithDeletion, arg.Status, arg.DeletedAt, arg.ID)
+	return err
+}
+
+const updateEventTag = `-- name: UpdateEventTag :exec
+UPDATE "event" SET tag = $1 WHERE id = $2
+`
+
+type UpdateEventTagParams struct {
+	Tag string
+	ID  string
+}
+
+// Event tag update.
+func (q *Queries) UpdateEventTag(ctx context.Context, arg UpdateEventTagParams) error {
+	_, err := q.db.ExecContext(ctx, updateEventTag, arg.Tag, arg.ID)
 	return err
 }
 
@@ -440,6 +2262,21 @@ func (q *Queries) UpdateRaceEvent(ctx context.Context, arg UpdateRaceEventParams
 	return err
 }
 
+const updateRaceResultPoints = `-- name: UpdateRaceResultPoints :exec
+UPDATE "race_result" SET points = $1 WHERE id = $2
+`
+
+type UpdateRaceResultPointsParams struct {
+	Points int32
+	ID     string
+}
+
+// Race result points update (used by recomputeEventPoints).
+func (q *Queries) UpdateRaceResultPoints(ctx context.Context, arg UpdateRaceResultPointsParams) error {
+	_, err := q.db.ExecContext(ctx, updateRaceResultPoints, arg.Points, arg.ID)
+	return err
+}
+
 const updateRaceSequence = `-- name: UpdateRaceSequence :exec
 UPDATE "race_event" SET sequence = $1 WHERE id = $2
 `
@@ -453,4 +2290,142 @@ type UpdateRaceSequenceParams struct {
 func (q *Queries) UpdateRaceSequence(ctx context.Context, arg UpdateRaceSequenceParams) error {
 	_, err := q.db.ExecContext(ctx, updateRaceSequence, arg.Sequence, arg.ID)
 	return err
+}
+
+const updateUserClassTier = `-- name: UpdateUserClassTier :exec
+UPDATE "user" SET "classTier" = $1 WHERE id = $2
+`
+
+type UpdateUserClassTierParams struct {
+	ClassTier interface{}
+	ID        string
+}
+
+// User class tier assignment.
+func (q *Queries) UpdateUserClassTier(ctx context.Context, arg UpdateUserClassTierParams) error {
+	_, err := q.db.ExecContext(ctx, updateUserClassTier, arg.ClassTier, arg.ID)
+	return err
+}
+
+const upsertEventPointsEntry = `-- name: UpsertEventPointsEntry :exec
+INSERT INTO "event_points_entry" (id, "eventId", "userId", points, "createdAt", "updatedAt")
+VALUES ($1, $2, $3, $4, $5, $5)
+ON CONFLICT ("eventId", "userId") DO UPDATE SET points = $4, "updatedAt" = $5
+`
+
+type UpsertEventPointsEntryParams struct {
+	ID        string
+	EventId   string
+	UserId    string
+	Points    int32
+	CreatedAt time.Time
+}
+
+// Points upsert (used by SetEventPoints).
+func (q *Queries) UpsertEventPointsEntry(ctx context.Context, arg UpsertEventPointsEntryParams) error {
+	_, err := q.db.ExecContext(ctx, upsertEventPointsEntry,
+		arg.ID,
+		arg.EventId,
+		arg.UserId,
+		arg.Points,
+		arg.CreatedAt,
+	)
+	return err
+}
+
+const upsertRaceResult = `-- name: UpsertRaceResult :one
+INSERT INTO "race_result" (id, "raceEventId", "userId", position, points,
+  "gateNumber", "finishTime", margin, "passingOrder", "final3F", "resultStatus",
+  "createdAt", "updatedAt")
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)
+ON CONFLICT ("raceEventId", "userId") DO UPDATE SET
+  position = COALESCE($4, "race_result".position),
+  points = $5,
+  "gateNumber" = COALESCE($6, "race_result"."gateNumber"),
+  "finishTime" = COALESCE($7, "race_result"."finishTime"),
+  margin = COALESCE($8, "race_result".margin),
+  "passingOrder" = COALESCE($9, "race_result"."passingOrder"),
+  "final3F" = COALESCE($10, "race_result"."final3F"),
+  "resultStatus" = COALESCE($11, "race_result"."resultStatus"),
+  "updatedAt" = $12
+RETURNING id, "raceEventId", "userId", position, points, "gateNumber", "finishTime",
+       margin, "passingOrder", "final3F", "resultStatus", "createdAt", "updatedAt"
+`
+
+type UpsertRaceResultParams struct {
+	ID           string
+	RaceEventId  string
+	UserId       string
+	Position     sql.NullInt32
+	Points       int32
+	GateNumber   sql.NullInt16
+	FinishTime   sql.NullString
+	Margin       sql.NullString
+	PassingOrder sql.NullString
+	Final3F      sql.NullString
+	ResultStatus sql.NullString
+	CreatedAt    time.Time
+}
+
+type UpsertRaceResultRow struct {
+	ID           string
+	RaceEventId  string
+	UserId       string
+	Position     sql.NullInt32
+	Points       int32
+	GateNumber   sql.NullInt16
+	FinishTime   sql.NullString
+	Margin       sql.NullString
+	PassingOrder sql.NullString
+	Final3F      sql.NullString
+	ResultStatus sql.NullString
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// Race result upsert with RETURNING (COALESCE keeps omitted fields).
+func (q *Queries) UpsertRaceResult(ctx context.Context, arg UpsertRaceResultParams) (UpsertRaceResultRow, error) {
+	row := q.db.QueryRowContext(ctx, upsertRaceResult,
+		arg.ID,
+		arg.RaceEventId,
+		arg.UserId,
+		arg.Position,
+		arg.Points,
+		arg.GateNumber,
+		arg.FinishTime,
+		arg.Margin,
+		arg.PassingOrder,
+		arg.Final3F,
+		arg.ResultStatus,
+		arg.CreatedAt,
+	)
+	var i UpsertRaceResultRow
+	err := row.Scan(
+		&i.ID,
+		&i.RaceEventId,
+		&i.UserId,
+		&i.Position,
+		&i.Points,
+		&i.GateNumber,
+		&i.FinishTime,
+		&i.Margin,
+		&i.PassingOrder,
+		&i.Final3F,
+		&i.ResultStatus,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const userExists = `-- name: UserExists :one
+SELECT EXISTS(SELECT 1 FROM "user" WHERE id = $1)
+`
+
+// User exists check (used by SetUserClass).
+func (q *Queries) UserExists(ctx context.Context, id string) (bool, error) {
+	row := q.db.QueryRowContext(ctx, userExists, id)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }

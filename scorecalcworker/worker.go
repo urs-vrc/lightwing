@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"time"
 
+
 	"encore.dev/rlog"
 	"encore.dev/pubsub"
 	"encore.app/scorecalc"
+	"encore.app/scorecalcworker/sqlc"
 )
 
 // db is the shared Lightwing database (direct reference: Encore tracks
@@ -26,17 +28,14 @@ func HandleScoreCalcRequest(ctx context.Context, event scorecalc.ScoreCalcReques
 	jobID, eventID, generation := event.JobID, event.EventID, event.Generation
 	rlog.Info(fmt.Sprintf("Received ScoreCalcRequested message: jobId=%s, eventId=%s, gen=%d", jobID, eventID, generation))
 
-	tx, err := db.Begin(ctx)
+	stx, err := std().BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer stx.Rollback()
+	qq := q().WithTx(stx)
 
-	var jobIDScanned, jobEventID, status string
-	var jobGeneration, attempts int
-	err = tx.QueryRow(ctx,
-		`SELECT id, "eventId", generation, status, attempts FROM "score_calc_task" WHERE id = $1`, jobID,
-	).Scan(&jobIDScanned, &jobEventID, &jobGeneration, &status, &attempts)
+	task, err := qq.GetTaskForClaim(ctx, jobID)
 	if errors.Is(err, sql.ErrNoRows) {
 		rlog.Warn(fmt.Sprintf("Job %s not found in database.", jobID))
 		return nil
@@ -44,24 +43,22 @@ func HandleScoreCalcRequest(ctx context.Context, event scorecalc.ScoreCalcReques
 	if err != nil {
 		return err
 	}
+	jobEventID, jobGeneration, status, attempts := task.EventId, int(task.Generation), task.Status, task.Attempts
 	if status == "COMPLETED" || status == "SUPERSEDED" {
 		rlog.Info(fmt.Sprintf("Job %s is already %s. Skipping.", jobID, status))
 		return nil
 	}
 
-	var latestGeneration int
-	err = tx.QueryRow(ctx,
-		`SELECT "latestGeneration" FROM "score_calc_state" WHERE "eventId" = $1`, jobEventID,
-	).Scan(&latestGeneration)
+	latestGeneration, err := qq.GetLatestGenerationState(ctx, jobEventID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if err == nil && jobGeneration < latestGeneration {
+	if err == nil && task.Generation < latestGeneration {
 		rlog.Info(fmt.Sprintf("Job %s generation %d is superseded by latest generation %d.", jobID, jobGeneration, latestGeneration))
-		if _, err := tx.Exec(ctx, `UPDATE "score_calc_task" SET status = 'SUPERSEDED' WHERE id = $1`, jobID); err != nil {
+		if err := qq.MarkTaskSuperseded(ctx, jobID); err != nil {
 			return err
 		}
-		return tx.Commit()
+		return stx.Commit()
 	}
 
 	if status != "PENDING" && status != "FAILED" {
@@ -70,26 +67,25 @@ func HandleScoreCalcRequest(ctx context.Context, event scorecalc.ScoreCalcReques
 	}
 
 	now := time.Now().UTC()
-	if _, err := tx.Exec(ctx,
-		`UPDATE "score_calc_task" SET status = 'PROCESSING', attempts = $1, "startedAt" = $2 WHERE id = $3`,
-		attempts+1, now, jobID,
-	); err != nil {
+	if err := qq.ClaimTask(ctx, sqlc.ClaimTaskParams{
+		Attempts:  attempts + 1,
+		StartedAt: sql.NullTime{Time: now, Valid: true},
+		ID:        jobID,
+	}); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := stx.Commit(); err != nil {
 		return err
 	}
 
-	var scoringType int
-	err = db.QueryRow(ctx,
-		`SELECT "scoringType" FROM "event" WHERE id = $1`, jobEventID,
-	).Scan(&scoringType)
+	scoringType, err := q().GetEventScoringType(ctx, jobEventID)
 	if errors.Is(err, sql.ErrNoRows) {
 		rlog.Error(fmt.Sprintf("Event %s not found for Job %s. Marking failed.", jobEventID, jobID))
-		if _, err := db.Exec(ctx,
-			`UPDATE "score_calc_task" SET status = 'FAILED', "lastError" = $1, "completedAt" = $2 WHERE id = $3`,
-			fmt.Sprintf("Event %s not found.", jobEventID), time.Now().UTC(), jobID,
-		); err != nil {
+		if err := q().FailTask(ctx, sqlc.FailTaskParams{
+			LastError:   sql.NullString{String: fmt.Sprintf("Event %s not found.", jobEventID), Valid: true},
+			CompletedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
+			ID:          jobID,
+		}); err != nil {
 			return err
 		}
 		_, err = scorecalc.ScoreCalcFailedTopic.Publish(ctx, scorecalc.ScoreCalcFailed{
@@ -107,50 +103,25 @@ func HandleScoreCalcRequest(ctx context.Context, event scorecalc.ScoreCalcReques
 
 	if scoringType != 1 {
 		rlog.Info(fmt.Sprintf("Event %s is not points-based (scoringType=%d). Rejecting job %s.", jobEventID, scoringType, jobID))
-		_, err = db.Exec(ctx,
-			`UPDATE "score_calc_task" SET status = 'SUPERSEDED', "lastError" = $1, "completedAt" = $2 WHERE id = $3`,
-			fmt.Sprintf("Rejected: event is not points-based (scoringType=%d)", scoringType), time.Now().UTC(), jobID,
-		)
-		return err
+		return q().SupersedeTaskWithError(ctx, sqlc.SupersedeTaskWithErrorParams{
+			LastError:   sql.NullString{String: fmt.Sprintf("Rejected: event is not points-based (scoringType=%d)", scoringType), Valid: true},
+			CompletedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
+			ID:          jobID,
+		})
 	}
 
-	rows, err := db.Query(ctx, `SELECT "userId" FROM "event_member" WHERE "eventId" = $1`, jobEventID)
+	members, err := q().ListEventMemberUserIDs(ctx, jobEventID)
 	if err != nil {
 		return err
 	}
-	var members []string
-	for rows.Next() {
-		var userID string
-		if err := rows.Scan(&userID); err != nil {
-			rows.Close()
-			return err
-		}
-		members = append(members, userID)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
 
-	rows, err = db.Query(ctx,
-		`SELECT r."userId", r.points FROM "race_result" r
-		 JOIN "race_event" re ON re.id = r."raceEventId"
-		 WHERE re."eventId" = $1`, jobEventID)
+	resultRows, err := q().ListRaceResultInputs(ctx, jobEventID)
 	if err != nil {
 		return err
 	}
-	var results []scorecalc.RaceResultInput
-	for rows.Next() {
-		var r scorecalc.RaceResultInput
-		if err := rows.Scan(&r.UserID, &r.Points); err != nil {
-			rows.Close()
-			return err
-		}
-		results = append(results, r)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
+	results := make([]scorecalc.RaceResultInput, 0, len(resultRows))
+	for _, r := range resultRows {
+		results = append(results, scorecalc.RaceResultInput{UserID: r.UserId, Points: int(r.Points)})
 	}
 
 	projection := scorecalc.CalculateEventProjection(scorecalc.EventScoreInput{

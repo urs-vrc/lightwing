@@ -8,6 +8,7 @@ import (
 
 	"encore.dev/beta/errs"
 	"encore.app/auth"
+	"encore.app/eventmanager/sqlc"
 )
 
 // --- Add member ---
@@ -25,20 +26,15 @@ type AddEventMemberRequest struct {
 // AddEventMemberCore registers a participant, enforcing the event's class
 // restriction and seeding the scoring record. Idempotent for existing members.
 func AddEventMemberCore(ctx context.Context, p *AddEventMemberRequest) (*EventDetail, error) {
-	var userTier sql.NullString
-	if err := db.QueryRow(ctx,
-		`SELECT "classTier" FROM "user" WHERE id = $1`, p.UserID,
-	).Scan(&userTier); errors.Is(err, sql.ErrNoRows) {
+	tier, err := q().GetUserClassTier(ctx, p.UserID)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "user not found"}
 	} else if err != nil {
 		return nil, err
 	}
+	userTier := nullStringFromAny(tier)
 
-	event, err := scanEventRow(db.QueryRow(ctx,
-		`SELECT `+eventColumns+` FROM "event" WHERE id = $1`, p.EventID))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, &errs.Error{Code: errs.NotFound, Message: "event not found"}
-	}
+	event, err := requireEventRow(ctx, p.EventID)
 	if err != nil {
 		return nil, err
 	}
@@ -49,21 +45,20 @@ func AddEventMemberCore(ctx context.Context, p *AddEventMemberRequest) (*EventDe
 		return nil, &errs.Error{Code: errs.FailedPrecondition, Message: "participant class tier does not satisfy the event class restriction"}
 	}
 
-	var memberExists bool
-	if err := db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM "event_member" WHERE "eventId" = $1 AND "userId" = $2)`,
-		p.EventID, p.UserID,
-	).Scan(&memberExists); err != nil {
+	memberExists, err := q().EventMemberExists(ctx, sqlc.EventMemberExistsParams{
+		EventId: p.EventID,
+		UserId:  p.UserID,
+	})
+	if err != nil {
 		return nil, err
 	}
 	if !memberExists {
 		if event.ParticipantLimit.Valid {
-			var currentCount int
-			if err := db.QueryRow(ctx,
-				`SELECT COUNT(*) FROM "event_member" WHERE "eventId" = $1`, p.EventID,
-			).Scan(&currentCount); err != nil {
+			currentCount64, err := q().GetEventMemberCount(ctx, p.EventID)
+			if err != nil {
 				return nil, err
 			}
+			currentCount := int(currentCount64)
 			if currentCount >= int(event.ParticipantLimit.Int64) {
 				return nil, &errs.Error{
 					Code:    errs.FailedPrecondition,
@@ -75,10 +70,9 @@ func AddEventMemberCore(ctx context.Context, p *AddEventMemberRequest) (*EventDe
 				}
 			}
 		}
-		if _, err := db.Exec(ctx,
-			`INSERT INTO "event_member" (id, "eventId", "userId", "createdAt")
-			 VALUES ($1, $2, $3, $4) ON CONFLICT ("eventId", "userId") DO NOTHING`,
-			newID(), p.EventID, p.UserID, time.Now().UTC()); err != nil {
+		if err := q().InsertEventMember(ctx, sqlc.InsertEventMemberParams{
+			ID: newID(), EventId: p.EventID, UserId: p.UserID, CreatedAt: time.Now().UTC(),
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -98,28 +92,29 @@ func AddEventMember(ctx context.Context, p *AddEventMemberRequest) (*EventDetail
 //
 // Mirrors ts-legacy/eventmanager/event-members.ts removeMemberFromEventInternal.
 func RemoveMemberFromEvent(ctx context.Context, eventID, userID string) error {
-	if _, err := db.Exec(ctx,
-		`DELETE FROM "event_member" WHERE "eventId" = $1 AND "userId" = $2`, eventID, userID); err != nil {
+	if err := q().DeleteEventMembersByUser(ctx, sqlc.DeleteEventMembersByUserParams{
+		EventId: eventID, UserId: userID,
+	}); err != nil {
 		return err
 	}
-	if _, err := db.Exec(ctx,
-		`DELETE FROM "event_points_entry" WHERE "eventId" = $1 AND "userId" = $2`, eventID, userID); err != nil {
+	if err := q().DeleteEventPointsByUser(ctx, sqlc.DeleteEventPointsByUserParams{
+		EventId: eventID, UserId: userID,
+	}); err != nil {
 		return err
 	}
-	if _, err := db.Exec(ctx,
-		`DELETE FROM "event_ladder_entry" WHERE "eventId" = $1 AND "userId" = $2`, eventID, userID); err != nil {
+	if err := q().DeleteEventLadderByUser(ctx, sqlc.DeleteEventLadderByUserParams{
+		EventId: eventID, UserId: userID,
+	}); err != nil {
 		return err
 	}
-	if _, err := db.Exec(ctx,
-		`DELETE FROM "race_event_member" WHERE "userId" = $1
-		 AND "raceEventId" IN (SELECT id FROM "race_event" WHERE "eventId" = $2)`,
-		userID, eventID); err != nil {
+	if err := q().DeleteRaceEventMemberByEvent(ctx, sqlc.DeleteRaceEventMemberByEventParams{
+		UserId: userID, EventId: eventID,
+	}); err != nil {
 		return err
 	}
-	if _, err := db.Exec(ctx,
-		`DELETE FROM "race_result" WHERE "userId" = $1
-		 AND "raceEventId" IN (SELECT id FROM "race_event" WHERE "eventId" = $2)`,
-		userID, eventID); err != nil {
+	if err := q().DeleteRaceResultsByEvent(ctx, sqlc.DeleteRaceResultsByEventParams{
+		UserId: userID, EventId: eventID,
+	}); err != nil {
 		return err
 	}
 	return nil
@@ -140,10 +135,8 @@ type RemoveEventMemberRequest struct {
 
 // RemoveEventMemberCore removes a participant from an event.
 func RemoveEventMemberCore(ctx context.Context, p *RemoveEventMemberRequest) (*EventDetail, error) {
-	var exists bool
-	if err := db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM "event" WHERE id = $1)`, p.EventID,
-	).Scan(&exists); err != nil {
+	exists, err := q().EventExists(ctx, p.EventID)
+	if err != nil {
 		return nil, err
 	}
 	if !exists {
@@ -184,20 +177,15 @@ func JoinEventCore(ctx context.Context, p *JoinEventRequest) (*EventDetail, erro
 	}
 	userID := actor.UserID
 
-	var userTier sql.NullString
-	if err := db.QueryRow(ctx,
-		`SELECT "classTier" FROM "user" WHERE id = $1`, userID,
-	).Scan(&userTier); errors.Is(err, sql.ErrNoRows) {
+	tier, err := q().GetUserClassTier(ctx, userID)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "user not found"}
 	} else if err != nil {
 		return nil, err
 	}
+	userTier := nullStringFromAny(tier)
 
-	event, err := scanEventRow(db.QueryRow(ctx,
-		`SELECT `+eventColumns+` FROM "event" WHERE id = $1`, p.EventID))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, &errs.Error{Code: errs.NotFound, Message: "event not found"}
-	}
+	event, err := requireEventRow(ctx, p.EventID)
 	if err != nil {
 		return nil, err
 	}
@@ -211,21 +199,20 @@ func JoinEventCore(ctx context.Context, p *JoinEventRequest) (*EventDetail, erro
 		return nil, &errs.Error{Code: errs.FailedPrecondition, Message: "participant class tier does not satisfy the event class restriction"}
 	}
 
-	var memberExists bool
-	if err := db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM "event_member" WHERE "eventId" = $1 AND "userId" = $2)`,
-		p.EventID, userID,
-	).Scan(&memberExists); err != nil {
+	memberExists, err := q().EventMemberExists(ctx, sqlc.EventMemberExistsParams{
+		EventId: p.EventID,
+		UserId:  userID,
+	})
+	if err != nil {
 		return nil, err
 	}
 	if !memberExists {
 		if event.ParticipantLimit.Valid {
-			var currentCount int
-			if err := db.QueryRow(ctx,
-				`SELECT COUNT(*) FROM "event_member" WHERE "eventId" = $1`, p.EventID,
-			).Scan(&currentCount); err != nil {
+			currentCount64, err := q().GetEventMemberCount(ctx, p.EventID)
+			if err != nil {
 				return nil, err
 			}
+			currentCount := int(currentCount64)
 			if currentCount >= int(event.ParticipantLimit.Int64) {
 				return nil, &errs.Error{
 					Code:    errs.FailedPrecondition,
@@ -237,10 +224,9 @@ func JoinEventCore(ctx context.Context, p *JoinEventRequest) (*EventDetail, erro
 				}
 			}
 		}
-		if _, err := db.Exec(ctx,
-			`INSERT INTO "event_member" (id, "eventId", "userId", "createdAt")
-			 VALUES ($1, $2, $3, $4) ON CONFLICT ("eventId", "userId") DO NOTHING`,
-			newID(), p.EventID, userID, time.Now().UTC()); err != nil {
+		if err := q().InsertEventMember(ctx, sqlc.InsertEventMemberParams{
+			ID: newID(), EventId: p.EventID, UserId: userID, CreatedAt: time.Now().UTC(),
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -269,11 +255,7 @@ type LeaveEventRequest struct {
 
 // LeaveEventCore lets an authenticated user withdraw from an event.
 func LeaveEventCore(ctx context.Context, p *LeaveEventRequest) (*EventDetail, error) {
-	event, err := scanEventRow(db.QueryRow(ctx,
-		`SELECT `+eventColumns+` FROM "event" WHERE id = $1`, p.EventID))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, &errs.Error{Code: errs.NotFound, Message: "event not found"}
-	}
+	event, err := requireEventRow(ctx, p.EventID)
 	if err != nil {
 		return nil, err
 	}
@@ -310,10 +292,8 @@ type SetEventSignupsLockedRequest struct {
 // SetEventSignupsLockedCore toggles an event's signup lock. Gated by
 // event-update permission.
 func SetEventSignupsLockedCore(ctx context.Context, p *SetEventSignupsLockedRequest) (*EventDetail, error) {
-	var exists bool
-	if err := db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM "event" WHERE id = $1)`, p.EventID,
-	).Scan(&exists); err != nil {
+	exists, err := q().EventExists(ctx, p.EventID)
+	if err != nil {
 		return nil, err
 	}
 	if !exists {
@@ -322,9 +302,9 @@ func SetEventSignupsLockedCore(ctx context.Context, p *SetEventSignupsLockedRequ
 	if _, err := auth.RequireEventPermission(ctx, p.Authorization, p.EventID, auth.ActionUpdate); err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(ctx,
-		`UPDATE "event" SET "signupsLocked" = $1, "updatedAt" = $2 WHERE id = $3`,
-		p.Locked, time.Now().UTC(), p.EventID); err != nil {
+	if err := q().UpdateEventSignupsLocked(ctx, sqlc.UpdateEventSignupsLockedParams{
+		SignupsLocked: p.Locked, UpdatedAt: time.Now().UTC(), ID: p.EventID,
+	}); err != nil {
 		return nil, err
 	}
 	return LoadEvent(ctx, p.EventID)

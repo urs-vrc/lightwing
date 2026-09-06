@@ -5,11 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"strings"
 	"time"
 
 	"encore.dev/beta/errs"
 	"encore.app/auth"
+	"encore.app/eventmanager/sqlc"
 	"encore.app/scorecalc"
 )
 
@@ -79,64 +79,73 @@ func RequireRace(ctx context.Context, eventID, raceID string) (*raceEventRow, er
 // RequireMembershipForResult asserts the user exists and is registered based
 // on the event's granularParticipation setting.
 func RequireMembershipForResult(ctx context.Context, eventID, raceID, userID string) error {
-	var exists bool
-	if err := db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM "user" WHERE id=$1)`, userID).Scan(&exists); err != nil {
+	exists, err := q().UserExists(ctx, userID)
+	if err != nil {
 		return err
 	}
 	if !exists {
 		return &errs.Error{Code: errs.NotFound, Message: "user not found"}
 	}
-	var granular sql.NullBool
-	if err := db.QueryRow(ctx,
-		`SELECT "granularParticipation" FROM "event" WHERE id=$1`, eventID).Scan(&granular); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return &errs.Error{Code: errs.NotFound, Message: "event not found"}
-		}
+	granular, err := q().GetEventGranularity(ctx, eventID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return &errs.Error{Code: errs.NotFound, Message: "event not found"}
+	}
+	if err != nil {
 		return err
 	}
-	if granular.Valid && granular.Bool {
-		if err := db.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM "race_event_member" WHERE "raceEventId"=$1 AND "userId"=$2)`,
-			raceID, userID).Scan(&exists); err != nil {
+	if granular {
+		registered, err := q().RaceMemberExists(ctx, sqlc.RaceMemberExistsParams{
+			RaceEventId: raceID,
+			UserId:      userID,
+		})
+		if err != nil {
 			return err
 		}
-		if !exists {
+		if !registered {
 			return &errs.Error{Code: errs.FailedPrecondition, Message: "user is not registered for this race"}
 		}
 	} else {
-		if err := db.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM "event_member" WHERE "eventId"=$1 AND "userId"=$2)`,
-			eventID, userID).Scan(&exists); err != nil {
+		member, err := q().EventMemberExists(ctx, sqlc.EventMemberExistsParams{
+			EventId: eventID,
+			UserId:  userID,
+		})
+		if err != nil {
 			return err
 		}
-		if !exists {
+		if !member {
 			return &errs.Error{Code: errs.FailedPrecondition, Message: "user is not a member of this event"}
 		}
 	}
 	return nil
 }
 
+// newRaceResultRow maps sqlc result columns onto the local raceResultRow.
+func newRaceResultRow(id, raceEventID, userID string, position sql.NullInt32, points int32, gateNumber sql.NullInt16, finishTime, margin, passingOrder, final3F, resultStatus sql.NullString, createdAt, updatedAt time.Time) *raceResultRow {
+	return &raceResultRow{
+		ID: id, RaceEventID: raceEventID, UserID: userID,
+		Position: sql.NullInt64{Int64: int64(position.Int32), Valid: position.Valid},
+		Points:   int(points),
+		GateNumber: sql.NullInt64{Int64: int64(gateNumber.Int16), Valid: gateNumber.Valid},
+		FinishTime: finishTime, Margin: margin, PassingOrder: passingOrder,
+		Final3F: final3F, ResultStatus: resultStatus,
+		CreatedAt: createdAt, UpdatedAt: updatedAt,
+	}
+}
+
 // ListResultsCore loads the full ordered result list for a race.
 func ListResultsCore(ctx context.Context, raceID string) ([]*RaceResultView, error) {
-	rows, err := db.Query(ctx,
-		`SELECT `+raceResultColumns+` FROM "race_result" WHERE "raceEventId"=$1
-		 ORDER BY position ASC NULLS LAST, points DESC`, raceID)
+	rows, err := q().ListRaceResults(ctx, raceID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	out := []*RaceResultView{}
-	for rows.Next() {
-		var r raceResultRow
-		if err := rows.Scan(&r.ID, &r.RaceEventID, &r.UserID, &r.Position, &r.Points,
-			&r.GateNumber, &r.FinishTime, &r.Margin, &r.PassingOrder, &r.Final3F,
-			&r.ResultStatus, &r.CreatedAt, &r.UpdatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, toRaceResultView(&r))
+	for _, r := range rows {
+		out = append(out, toRaceResultView(newRaceResultRow(
+			r.ID, r.RaceEventId, r.UserId, r.Position, r.Points, r.GateNumber,
+			r.FinishTime, r.Margin, r.PassingOrder, r.Final3F, r.ResultStatus,
+			r.CreatedAt, r.UpdatedAt)))
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // RaceResultInput mirrors the TS RaceResultInput: nil means omitted (leave
@@ -158,24 +167,20 @@ type RaceResultInput struct {
 
 // eventScoringRules loads an event's scoring mode + custom tables.
 func eventScoringRules(ctx context.Context, eventID string) (scoringType int, mode string, custom any, err error) {
-	var modeNS sql.NullString
-	var customBytes []byte
-	err = db.QueryRow(ctx,
-		`SELECT "scoringType", "scoringRulesMode", "customScoringTables" FROM "event" WHERE id=$1`,
-		eventID).Scan(&scoringType, &modeNS, &customBytes)
+	rules, err := q().GetEventScoringRules(ctx, eventID)
 	if err != nil {
 		return 0, "", nil, err
 	}
-	if modeNS.Valid {
-		mode = modeNS.String
+	if rules.ScoringRulesMode.Valid {
+		mode = rules.ScoringRulesMode.String
 	}
-	if len(customBytes) > 0 {
+	if rules.CustomScoringTables.Valid && len(rules.CustomScoringTables.RawMessage) > 0 {
 		var v any
-		if uerr := json.Unmarshal(customBytes, &v); uerr == nil {
+		if uerr := json.Unmarshal(rules.CustomScoringTables.RawMessage, &v); uerr == nil {
 			custom = v
 		}
 	}
-	return scoringType, mode, custom, nil
+	return int(rules.ScoringType), mode, custom, nil
 }
 
 // resolveEntryPoints computes the points to persist for a result entry on a
@@ -201,63 +206,51 @@ func resolveEntryPoints(scoringType int, mode string, custom any, grade string, 
 func upsertRaceResult(ctx context.Context, raceID string, entry *RaceResultInput, points int) (*raceResultRow, error) {
 	id := "raceresult-" + newID()[:8]
 	now := time.Now().UTC()
-	var position any
+	var position sql.NullInt32
 	if entry.Position != nil {
-		position = *entry.Position
+		position = sql.NullInt32{Int32: int32(*entry.Position), Valid: true}
 	}
-	var gateNumber any
+	var gateNumber sql.NullInt16
 	if entry.GateNumber != nil {
-		gateNumber = int64(*entry.GateNumber)
+		gateNumber = sql.NullInt16{Int16: int16(*entry.GateNumber), Valid: true}
 	}
-	var r raceResultRow
-	err := db.QueryRow(ctx,
-		`INSERT INTO "race_result" (id, "raceEventId", "userId", position, points,
-		  "gateNumber", "finishTime", margin, "passingOrder", "final3F", "resultStatus",
-		  "createdAt", "updatedAt")
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)
-		 ON CONFLICT ("raceEventId", "userId") DO UPDATE SET
-		  position = COALESCE($4, "race_result".position),
-		  points = $5,
-		  "gateNumber" = COALESCE($6, "race_result"."gateNumber"),
-		  "finishTime" = COALESCE($7, "race_result"."finishTime"),
-		  margin = COALESCE($8, "race_result".margin),
-		  "passingOrder" = COALESCE($9, "race_result"."passingOrder"),
-		  "final3F" = COALESCE($10, "race_result"."final3F"),
-		  "resultStatus" = COALESCE($11, "race_result"."resultStatus"),
-		  "updatedAt" = $12
-		 RETURNING `+raceResultColumns,
-		id, raceID, entry.UserID, position, points, gateNumber,
-		entry.FinishTime, entry.Margin, entry.PassingOrder, entry.Final3F,
-		entry.ResultStatus, now,
-	).Scan(&r.ID, &r.RaceEventID, &r.UserID, &r.Position, &r.Points,
-		&r.GateNumber, &r.FinishTime, &r.Margin, &r.PassingOrder, &r.Final3F,
-		&r.ResultStatus, &r.CreatedAt, &r.UpdatedAt)
+	upserted, err := q().UpsertRaceResult(ctx, sqlc.UpsertRaceResultParams{
+		ID: id, RaceEventId: raceID, UserId: entry.UserID, Position: position,
+		Points: int32(points), GateNumber: gateNumber,
+		FinishTime: nullStringFromPtr(entry.FinishTime),
+		Margin:     nullStringFromPtr(entry.Margin),
+		PassingOrder: nullStringFromPtr(entry.PassingOrder),
+		Final3F:      nullStringFromPtr(entry.Final3F),
+		ResultStatus: nullStringFromPtr(entry.ResultStatus),
+		CreatedAt: now,
+	})
 	if err != nil {
 		return nil, err
 	}
+	r := newRaceResultRow(
+		upserted.ID, upserted.RaceEventId, upserted.UserId, upserted.Position,
+		upserted.Points, upserted.GateNumber, upserted.FinishTime, upserted.Margin,
+		upserted.PassingOrder, upserted.Final3F, upserted.ResultStatus,
+		upserted.CreatedAt, upserted.UpdatedAt)
 	// Explicit clears (COALESCE keeps old values, so apply NULLs separately).
-	if entry.ClearPosition || entry.ClearStatus {
-		setClause := []string{}
-		args := []any{}
-		if entry.ClearPosition {
-			setClause = append(setClause, "position = NULL")
-		}
-		if entry.ClearStatus {
-			setClause = append(setClause, `"resultStatus" = NULL`)
-		}
-		_ = args
-		if _, err := db.Exec(ctx,
-			`UPDATE "race_result" SET `+strings.Join(setClause, ", ")+` WHERE id=$1`, r.ID); err != nil {
+	if entry.ClearPosition && entry.ClearStatus {
+		if err := q().ClearRaceResultPositionAndStatus(ctx, r.ID); err != nil {
 			return nil, err
 		}
-		if entry.ClearPosition {
-			r.Position = sql.NullInt64{}
+		r.Position = sql.NullInt64{}
+		r.ResultStatus = sql.NullString{}
+	} else if entry.ClearPosition {
+		if err := q().ClearRaceResultPosition(ctx, r.ID); err != nil {
+			return nil, err
 		}
-		if entry.ClearStatus {
-			r.ResultStatus = sql.NullString{}
+		r.Position = sql.NullInt64{}
+	} else if entry.ClearStatus {
+		if err := q().ClearRaceResultStatus(ctx, r.ID); err != nil {
+			return nil, err
 		}
+		r.ResultStatus = sql.NullString{}
 	}
-	return &r, nil
+	return r, nil
 }
 
 // submitCalcForUsers queues a scorecalc job, skipping empty user lists
@@ -385,12 +378,14 @@ func DeleteRaceResultCore(ctx context.Context, p *DeleteRaceResultRequest) (*Del
 	if _, err := RequireRace(ctx, p.EventID, p.RaceID); err != nil {
 		return nil, err
 	}
-	res, err := db.Exec(ctx,
-		`DELETE FROM "race_result" WHERE "raceEventId"=$1 AND "userId"=$2`, p.RaceID, p.UserID)
+	affected, err := q().DeleteRaceResult(ctx, sqlc.DeleteRaceResultParams{
+		RaceEventId: p.RaceID,
+		UserId:      p.UserID,
+	})
 	if err != nil {
 		return nil, err
 	}
-	if res.RowsAffected() == 0 {
+	if affected == 0 {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "result not found"}
 	}
 	if err := ApplyAutoDeferralsForEvent(ctx, p.EventID, &p.RaceID); err != nil {
@@ -467,29 +462,18 @@ func ApplyAutoDeferralsForEvent(ctx context.Context, eventID string, modifiedRac
 		resultStatus sql.NullString
 		classTier    sql.NullString
 	}
-	rows, err := db.Query(ctx,
-		`SELECT res.id, res."raceEventId", r.grade, res."userId", res.position,
-		        res.points, res."resultStatus", u."classTier"
-		 FROM "race_result" res
-		 JOIN "race_event" r ON r.id = res."raceEventId"
-		 JOIN "user" u ON u.id = res."userId"
-		 WHERE r."eventId" = $1`, eventID)
+	rows, err := q().ListAutoDeferralInputs(ctx, eventID)
 	if err != nil {
 		return err
 	}
 	var results []resultInfo
-	for rows.Next() {
-		var ri resultInfo
-		if err := rows.Scan(&ri.id, &ri.raceID, &ri.grade, &ri.userID, &ri.position,
-			&ri.points, &ri.resultStatus, &ri.classTier); err != nil {
-			rows.Close()
-			return err
-		}
-		results = append(results, ri)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
+	for _, r := range rows {
+		results = append(results, resultInfo{
+			id: r.ID, raceID: r.RaceEventId, grade: r.Grade, userID: r.UserId,
+			position: sql.NullInt64{Int64: int64(r.Position.Int32), Valid: r.Position.Valid},
+			points:   int(r.Points), resultStatus: r.ResultStatus,
+			classTier: nullStringFromAny(r.ClassTier),
+		})
 	}
 	isUngraded := func(tier sql.NullString) bool {
 		return !tier.Valid || tier.String == "PRE_OP" || tier.String == "OP"
@@ -505,26 +489,15 @@ func ApplyAutoDeferralsForEvent(ctx context.Context, eventID string, modifiedRac
 	}
 	raceGrades := map[string]string{}
 	raceSeqs := map[string]int{}
-	grows, err := db.Query(ctx, `SELECT id, grade, sequence FROM "race_event" WHERE "eventId"=$1`, eventID)
+	grows, err := q().ListEligibleRaces(ctx, eventID)
 	if err != nil {
 		return err
 	}
-	for grows.Next() {
-		var rid string
-		var g sql.NullString
-		var seq int
-		if err := grows.Scan(&rid, &g, &seq); err != nil {
-			grows.Close()
-			return err
+	for _, gr := range grows {
+		if gr.Grade.Valid {
+			raceGrades[gr.ID] = gr.Grade.String
 		}
-		if g.Valid {
-			raceGrades[rid] = g.String
-		}
-		raceSeqs[rid] = seq
-	}
-	grows.Close()
-	if err := grows.Err(); err != nil {
-		return err
+		raceSeqs[gr.ID] = int(gr.Sequence)
 	}
 
 	// Qualification: 1st place in an auto-defer grade, ungraded, no terminal status.
@@ -547,8 +520,8 @@ func ApplyAutoDeferralsForEvent(ctx context.Context, eventID string, modifiedRac
 	// All registered users per race: event members (non-granular) + result
 	// holders + explicit race members.
 	var granular bool
-	if err := db.QueryRow(ctx,
-		`SELECT "granularParticipation" FROM "event" WHERE id=$1`, eventID).Scan(&granular); err != nil {
+	granular, err = q().GetEventGranularity(ctx, eventID)
+	if err != nil {
 		return err
 	}
 	raceUsers := map[string]map[string]bool{}
@@ -559,26 +532,12 @@ func ApplyAutoDeferralsForEvent(ctx context.Context, eventID string, modifiedRac
 		raceUsers[raceID][userID] = true
 	}
 	if !granular {
-		mrows, err := db.Query(ctx, `SELECT "userId" FROM "event_member" WHERE "eventId"=$1`, eventID)
+		memberIDs, err := q().ListEventMemberIDs(ctx, eventID)
 		if err != nil {
 			return err
 		}
 		raceIDs, err := raceIDsForEvent(ctx, eventID)
 		if err != nil {
-			mrows.Close()
-			return err
-		}
-		var memberIDs []string
-		for mrows.Next() {
-			var uid string
-			if err := mrows.Scan(&uid); err != nil {
-				mrows.Close()
-				return err
-			}
-			memberIDs = append(memberIDs, uid)
-		}
-		mrows.Close()
-		if err := mrows.Err(); err != nil {
 			return err
 		}
 		for _, rid := range raceIDs {
@@ -590,23 +549,12 @@ func ApplyAutoDeferralsForEvent(ctx context.Context, eventID string, modifiedRac
 	for _, res := range results {
 		addUser(res.raceID, res.userID)
 	}
-	rmrows, err := db.Query(ctx,
-		`SELECT m."raceEventId", m."userId" FROM "race_event_member" m
-		 JOIN "race_event" r ON r.id = m."raceEventId" WHERE r."eventId"=$1`, eventID)
+	rmrows, err := q().ListRaceMemberPairs(ctx, eventID)
 	if err != nil {
 		return err
 	}
-	for rmrows.Next() {
-		var rid, uid string
-		if err := rmrows.Scan(&rid, &uid); err != nil {
-			rmrows.Close()
-			return err
-		}
-		addUser(rid, uid)
-	}
-	rmrows.Close()
-	if err := rmrows.Err(); err != nil {
-		return err
+	for _, rm := range rmrows {
+		addUser(rm.RaceEventId, rm.UserId)
 	}
 	lookup := map[string]map[string]*resultInfo{}
 	for i := range results {
@@ -625,16 +573,15 @@ func ApplyAutoDeferralsForEvent(ctx context.Context, eventID string, modifiedRac
 
 			if shouldDefer {
 				if existing == nil {
-					if _, err := db.Exec(ctx,
-						`INSERT INTO "race_result" (id, "raceEventId", "userId", points, "resultStatus", "createdAt", "updatedAt")
-						 VALUES ($1,$2,$3,0,'DEFERRED',$4,$4)`,
-						"raceresult-"+newID()[:8], raceID, userID, time.Now().UTC()); err != nil {
+					if err := q().InsertDeferredResult(ctx, sqlc.InsertDeferredResultParams{
+						ID: "raceresult-" + newID()[:8], RaceEventId: raceID, UserId: userID,
+						CreatedAt: time.Now().UTC(),
+					}); err != nil {
 						return err
 					}
 				} else if !existing.resultStatus.Valid || existing.resultStatus.String == "DEFERRED" {
 					if !existing.resultStatus.Valid || existing.points != 0 {
-						if _, err := db.Exec(ctx,
-							`UPDATE "race_result" SET "resultStatus"='DEFERRED', points=0 WHERE id=$1`, existing.id); err != nil {
+						if err := q().MarkResultDeferred(ctx, existing.id); err != nil {
 							return err
 						}
 					}
@@ -650,8 +597,9 @@ func ApplyAutoDeferralsForEvent(ctx context.Context, eventID string, modifiedRac
 						pos = &n
 					}
 					restored := ResolvePoints(mode, custom, raceGrades[raceID], pos, "")
-					if _, err := db.Exec(ctx,
-						`UPDATE "race_result" SET "resultStatus"=NULL, points=$1 WHERE id=$2`, restored, existing.id); err != nil {
+					if err := q().RestoreDeferredResult(ctx, sqlc.RestoreDeferredResultParams{
+						Points: int32(restored), ID: existing.id,
+					}); err != nil {
 						return err
 					}
 				}
@@ -663,18 +611,5 @@ func ApplyAutoDeferralsForEvent(ctx context.Context, eventID string, modifiedRac
 
 // raceIDsForEvent returns all race ids of an event.
 func raceIDsForEvent(ctx context.Context, eventID string) ([]string, error) {
-	rows, err := db.Query(ctx, `SELECT id FROM "race_event" WHERE "eventId"=$1`, eventID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
+	return q().ListRaceIDs(ctx, eventID)
 }

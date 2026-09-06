@@ -8,7 +8,34 @@ package sqlc
 import (
 	"context"
 	"database/sql"
+	"time"
+
+	"github.com/lib/pq"
 )
+
+const countUsers = `-- name: CountUsers :one
+SELECT COUNT(*) FROM "user"
+`
+
+func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countUsers)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countUsersBySearch = `-- name: CountUsersBySearch :one
+SELECT COUNT(*) FROM "user"
+WHERE ($1::text = '' OR name ILIKE $1 ESCAPE '\' OR "vrchatUsername" ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\' OR slug ILIKE $1 ESCAPE '\')
+`
+
+// User list count with optional ILIKE search (empty pattern matches all).
+func (q *Queries) CountUsersBySearch(ctx context.Context, dollar_1 string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countUsersBySearch, dollar_1)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
 
 const deleteSessionByToken = `-- name: DeleteSessionByToken :exec
 DELETE FROM "session" WHERE "token" = $1
@@ -17,6 +44,15 @@ DELETE FROM "session" WHERE "token" = $1
 // Session delete (used by compat.go Logout).
 func (q *Queries) DeleteSessionByToken(ctx context.Context, token string) error {
 	_, err := q.db.ExecContext(ctx, deleteSessionByToken, token)
+	return err
+}
+
+const deleteSessionsByUser = `-- name: DeleteSessionsByUser :exec
+DELETE FROM "session" WHERE "userId" = $1
+`
+
+func (q *Queries) DeleteSessionsByUser(ctx context.Context, userid string) error {
+	_, err := q.db.ExecContext(ctx, deleteSessionsByUser, userid)
 	return err
 }
 
@@ -47,6 +83,33 @@ func (q *Queries) EventAdminExists(ctx context.Context, arg EventAdminExistsPara
 	return exists, err
 }
 
+const getActorSession = `-- name: GetActorSession :one
+SELECT s."userId", s."activeOrganizationId", u."siteRole"::text, s."expiresAt"
+FROM "session" s
+JOIN "user" u ON u.id = s."userId"
+WHERE s."token" = $1
+`
+
+type GetActorSessionRow struct {
+	UserId               string
+	ActiveOrganizationId sql.NullString
+	USiteRole            string
+	ExpiresAt            time.Time
+}
+
+// Actor session join (used by resolveActor).
+func (q *Queries) GetActorSession(ctx context.Context, token string) (GetActorSessionRow, error) {
+	row := q.db.QueryRowContext(ctx, getActorSession, token)
+	var i GetActorSessionRow
+	err := row.Scan(
+		&i.UserId,
+		&i.ActiveOrganizationId,
+		&i.USiteRole,
+		&i.ExpiresAt,
+	)
+	return i, err
+}
+
 const getDiscordAccountID = `-- name: GetDiscordAccountID :one
 SELECT "accountId" FROM "account" WHERE "userId" = $1 AND "providerId" = 'discord' ORDER BY "updatedAt" DESC LIMIT 1
 `
@@ -57,6 +120,71 @@ func (q *Queries) GetDiscordAccountID(ctx context.Context, userid string) (strin
 	var accountId string
 	err := row.Scan(&accountId)
 	return accountId, err
+}
+
+const getDiscordAccountRowID = `-- name: GetDiscordAccountRowID :one
+SELECT id FROM "account" WHERE "userId" = $1 AND "providerId" = 'discord'
+`
+
+func (q *Queries) GetDiscordAccountRowID(ctx context.Context, userid string) (string, error) {
+	row := q.db.QueryRowContext(ctx, getDiscordAccountRowID, userid)
+	var id string
+	err := row.Scan(&id)
+	return id, err
+}
+
+const getDiscordUserID = `-- name: GetDiscordUserID :one
+
+SELECT "userId" FROM "account" WHERE "providerId" = 'discord' AND "accountId" = $1
+`
+
+// Discord callback login upsert (used by the OAuth callback tx).
+func (q *Queries) GetDiscordUserID(ctx context.Context, accountid string) (string, error) {
+	row := q.db.QueryRowContext(ctx, getDiscordUserID, accountid)
+	var userId string
+	err := row.Scan(&userId)
+	return userId, err
+}
+
+const getEventOwnership = `-- name: GetEventOwnership :one
+SELECT "ownerType"::text, "ownerUserId", "organizationId" FROM "event" WHERE id = $1
+`
+
+type GetEventOwnershipRow struct {
+	OwnerType      string
+	OwnerUserId    sql.NullString
+	OrganizationId sql.NullString
+}
+
+// Event ownership (used by getEventActor).
+func (q *Queries) GetEventOwnership(ctx context.Context, id string) (GetEventOwnershipRow, error) {
+	row := q.db.QueryRowContext(ctx, getEventOwnership, id)
+	var i GetEventOwnershipRow
+	err := row.Scan(&i.OwnerType, &i.OwnerUserId, &i.OrganizationId)
+	return i, err
+}
+
+const getFirstUserID = `-- name: GetFirstUserID :one
+SELECT id FROM "user" ORDER BY "createdAt" ASC LIMIT 1
+`
+
+// First user id (bootstrap admin check).
+func (q *Queries) GetFirstUserID(ctx context.Context) (string, error) {
+	row := q.db.QueryRowContext(ctx, getFirstUserID)
+	var id string
+	err := row.Scan(&id)
+	return id, err
+}
+
+const getMemberActiveOrg = `-- name: GetMemberActiveOrg :one
+SELECT "organizationId" FROM "member" WHERE "userId" = $1 ORDER BY "createdAt" ASC LIMIT 1
+`
+
+func (q *Queries) GetMemberActiveOrg(ctx context.Context, userid string) (string, error) {
+	row := q.db.QueryRowContext(ctx, getMemberActiveOrg, userid)
+	var organizationId string
+	err := row.Scan(&organizationId)
+	return organizationId, err
 }
 
 const getMemberRole = `-- name: GetMemberRole :one
@@ -76,6 +204,22 @@ func (q *Queries) GetMemberRole(ctx context.Context, arg GetMemberRoleParams) (s
 	return role, err
 }
 
+const getOAuthStateValue = `-- name: GetOAuthStateValue :one
+SELECT "value" FROM "verification" WHERE "identifier" = $1 AND "expiresAt" > $2
+`
+
+type GetOAuthStateValueParams struct {
+	Identifier string
+	ExpiresAt  time.Time
+}
+
+func (q *Queries) GetOAuthStateValue(ctx context.Context, arg GetOAuthStateValueParams) (string, error) {
+	row := q.db.QueryRowContext(ctx, getOAuthStateValue, arg.Identifier, arg.ExpiresAt)
+	var value string
+	err := row.Scan(&value)
+	return value, err
+}
+
 const getOrgBySlug = `-- name: GetOrgBySlug :one
 SELECT id FROM "organization" WHERE slug = $1
 `
@@ -84,6 +228,27 @@ SELECT id FROM "organization" WHERE slug = $1
 func (q *Queries) GetOrgBySlug(ctx context.Context, slug string) (string, error) {
 	row := q.db.QueryRowContext(ctx, getOrgBySlug, slug)
 	var id string
+	err := row.Scan(&id)
+	return id, err
+}
+
+const getSessionExpiry = `-- name: GetSessionExpiry :one
+SELECT "expiresAt" FROM "session" WHERE "token" = $1
+`
+
+func (q *Queries) GetSessionExpiry(ctx context.Context, token string) (time.Time, error) {
+	row := q.db.QueryRowContext(ctx, getSessionExpiry, token)
+	var expiresAt time.Time
+	err := row.Scan(&expiresAt)
+	return expiresAt, err
+}
+
+const getUserByID = `-- name: GetUserByID :one
+SELECT id FROM "user" WHERE id = $1
+`
+
+func (q *Queries) GetUserByID(ctx context.Context, id string) (string, error) {
+	row := q.db.QueryRowContext(ctx, getUserByID, id)
 	err := row.Scan(&id)
 	return id, err
 }
@@ -100,6 +265,371 @@ func (q *Queries) GetUserBySlug(ctx context.Context, slug sql.NullString) (strin
 	return id, err
 }
 
+const getUserNameSlug = `-- name: GetUserNameSlug :one
+SELECT name, slug FROM "user" WHERE id = $1
+`
+
+type GetUserNameSlugRow struct {
+	Name string
+	Slug sql.NullString
+}
+
+// User name/slug (used by ensureUserSlug).
+func (q *Queries) GetUserNameSlug(ctx context.Context, id string) (GetUserNameSlugRow, error) {
+	row := q.db.QueryRowContext(ctx, getUserNameSlug, id)
+	var i GetUserNameSlugRow
+	err := row.Scan(&i.Name, &i.Slug)
+	return i, err
+}
+
+const getUserProfileRow = `-- name: GetUserProfileRow :one
+SELECT id, name, email, image, slug, biography, "careerOverview",
+       "vrchatUsername", "classTier", "siteRole"::text, "createdAt", "updatedAt"
+FROM "user" WHERE id = $1
+`
+
+type GetUserProfileRowRow struct {
+	ID             string
+	Name           string
+	Email          string
+	Image          sql.NullString
+	Slug           sql.NullString
+	Biography      sql.NullString
+	CareerOverview sql.NullString
+	VrchatUsername sql.NullString
+	ClassTier      interface{}
+	SiteRole       string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// Full user row for profiles.
+func (q *Queries) GetUserProfileRow(ctx context.Context, id string) (GetUserProfileRowRow, error) {
+	row := q.db.QueryRowContext(ctx, getUserProfileRow, id)
+	var i GetUserProfileRowRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Email,
+		&i.Image,
+		&i.Slug,
+		&i.Biography,
+		&i.CareerOverview,
+		&i.VrchatUsername,
+		&i.ClassTier,
+		&i.SiteRole,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getUserSiteRole = `-- name: GetUserSiteRole :one
+SELECT "siteRole"::text FROM "user" WHERE id = $1
+`
+
+func (q *Queries) GetUserSiteRole(ctx context.Context, id string) (string, error) {
+	row := q.db.QueryRowContext(ctx, getUserSiteRole, id)
+	var siteRole string
+	err := row.Scan(&siteRole)
+	return siteRole, err
+}
+
+const insertDebugUser = `-- name: InsertDebugUser :exec
+INSERT INTO "user" (id, name, email, image, "siteRole", "vrchatUsername", slug, "createdAt", "updatedAt")
+VALUES ($1, 'Debug User', 'debug-user@local.invalid', '', 'SITE_ADMIN', '', $2, $3, $3)
+`
+
+type InsertDebugUserParams struct {
+	ID        string
+	Slug      sql.NullString
+	CreatedAt time.Time
+}
+
+// Debug login user insert (fixed SITE_ADMIN debug user).
+func (q *Queries) InsertDebugUser(ctx context.Context, arg InsertDebugUserParams) error {
+	_, err := q.db.ExecContext(ctx, insertDebugUser, arg.ID, arg.Slug, arg.CreatedAt)
+	return err
+}
+
+const insertDiscordAccount = `-- name: InsertDiscordAccount :exec
+INSERT INTO "account" (id, "accountId", "providerId", "userId", "accessToken",
+                        "refreshToken", "scope", "accessTokenExpiresAt", "createdAt", "updatedAt")
+VALUES ($1, $2, 'discord', $3, $4, $5, $6, $7, $8, $8)
+`
+
+type InsertDiscordAccountParams struct {
+	ID                   string
+	AccountId            string
+	UserId               string
+	AccessToken          sql.NullString
+	RefreshToken         sql.NullString
+	Scope                sql.NullString
+	AccessTokenExpiresAt sql.NullTime
+	CreatedAt            time.Time
+}
+
+func (q *Queries) InsertDiscordAccount(ctx context.Context, arg InsertDiscordAccountParams) error {
+	_, err := q.db.ExecContext(ctx, insertDiscordAccount,
+		arg.ID,
+		arg.AccountId,
+		arg.UserId,
+		arg.AccessToken,
+		arg.RefreshToken,
+		arg.Scope,
+		arg.AccessTokenExpiresAt,
+		arg.CreatedAt,
+	)
+	return err
+}
+
+const insertSession = `-- name: InsertSession :exec
+INSERT INTO "session" (id, "userId", token, "activeOrganizationId", "expiresAt", "createdAt", "updatedAt")
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+`
+
+type InsertSessionParams struct {
+	ID                   string
+	UserId               string
+	Token                string
+	ActiveOrganizationId sql.NullString
+	ExpiresAt            time.Time
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+}
+
+func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) error {
+	_, err := q.db.ExecContext(ctx, insertSession,
+		arg.ID,
+		arg.UserId,
+		arg.Token,
+		arg.ActiveOrganizationId,
+		arg.ExpiresAt,
+		arg.CreatedAt,
+		arg.UpdatedAt,
+	)
+	return err
+}
+
+const insertUser = `-- name: InsertUser :exec
+INSERT INTO "user" (id, name, email, image, "siteRole", "vrchatUsername", slug, "createdAt", "updatedAt")
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+`
+
+type InsertUserParams struct {
+	ID             string
+	Name           string
+	Email          string
+	Image          sql.NullString
+	SiteRole       interface{}
+	VrchatUsername sql.NullString
+	Slug           sql.NullString
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+func (q *Queries) InsertUser(ctx context.Context, arg InsertUserParams) error {
+	_, err := q.db.ExecContext(ctx, insertUser,
+		arg.ID,
+		arg.Name,
+		arg.Email,
+		arg.Image,
+		arg.SiteRole,
+		arg.VrchatUsername,
+		arg.Slug,
+		arg.CreatedAt,
+		arg.UpdatedAt,
+	)
+	return err
+}
+
+const listTeamAffiliations = `-- name: ListTeamAffiliations :many
+SELECT m."userId", o.id, o.name, o.slug, m.role
+FROM "member" m
+JOIN "organization" o ON o.id = m."organizationId"
+WHERE m."userId" = ANY($1::text[])
+ORDER BY o."createdAt" ASC
+`
+
+type ListTeamAffiliationsRow struct {
+	UserId string
+	ID     string
+	Name   string
+	Slug   string
+	Role   string
+}
+
+// Team affiliations for a batch of users.
+func (q *Queries) ListTeamAffiliations(ctx context.Context, dollar_1 []string) ([]ListTeamAffiliationsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listTeamAffiliations, pq.Array(dollar_1))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListTeamAffiliationsRow
+	for rows.Next() {
+		var i ListTeamAffiliationsRow
+		if err := rows.Scan(
+			&i.UserId,
+			&i.ID,
+			&i.Name,
+			&i.Slug,
+			&i.Role,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUserRows = `-- name: ListUserRows :many
+SELECT id, name, email, image, slug, biography, "careerOverview",
+       "vrchatUsername", "classTier", "siteRole"::text, "createdAt", "updatedAt"
+FROM "user"
+WHERE ($1::text = '' OR name ILIKE $1 ESCAPE '\' OR "vrchatUsername" ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\' OR slug ILIKE $1 ESCAPE '\')
+ORDER BY "createdAt" ASC
+LIMIT NULLIF($2::int, 0) OFFSET $3::int
+`
+
+type ListUserRowsParams struct {
+	Column1 string
+	Column2 int32
+	Column3 int32
+}
+
+type ListUserRowsRow struct {
+	ID             string
+	Name           string
+	Email          string
+	Image          sql.NullString
+	Slug           sql.NullString
+	Biography      sql.NullString
+	CareerOverview sql.NullString
+	VrchatUsername sql.NullString
+	ClassTier      interface{}
+	SiteRole       string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// User list page with optional ILIKE search.
+func (q *Queries) ListUserRows(ctx context.Context, arg ListUserRowsParams) ([]ListUserRowsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listUserRows, arg.Column1, arg.Column2, arg.Column3)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListUserRowsRow
+	for rows.Next() {
+		var i ListUserRowsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Email,
+			&i.Image,
+			&i.Slug,
+			&i.Biography,
+			&i.CareerOverview,
+			&i.VrchatUsername,
+			&i.ClassTier,
+			&i.SiteRole,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const storeOAuthState = `-- name: StoreOAuthState :exec
+INSERT INTO "verification" ("id", "identifier", "value", "expiresAt", "createdAt", "updatedAt")
+VALUES ($1, $1, $2, $3, $4, $4)
+`
+
+type StoreOAuthStateParams struct {
+	Identifier string
+	StateValue string
+	ExpiresAt  time.Time
+	Now        sql.NullTime
+}
+
+// OAuth state store (id and identifier carry the same value).
+func (q *Queries) StoreOAuthState(ctx context.Context, arg StoreOAuthStateParams) error {
+	_, err := q.db.ExecContext(ctx, storeOAuthState,
+		arg.Identifier,
+		arg.StateValue,
+		arg.ExpiresAt,
+		arg.Now,
+	)
+	return err
+}
+
+const updateDiscordAccount = `-- name: UpdateDiscordAccount :exec
+UPDATE "account" SET "accessToken" = $1, "refreshToken" = $2, "scope" = $3,
+                     "accessTokenExpiresAt" = $4, "updatedAt" = $5
+WHERE id = $6
+`
+
+type UpdateDiscordAccountParams struct {
+	AccessToken          sql.NullString
+	RefreshToken         sql.NullString
+	Scope                sql.NullString
+	AccessTokenExpiresAt sql.NullTime
+	UpdatedAt            time.Time
+	ID                   string
+}
+
+func (q *Queries) UpdateDiscordAccount(ctx context.Context, arg UpdateDiscordAccountParams) error {
+	_, err := q.db.ExecContext(ctx, updateDiscordAccount,
+		arg.AccessToken,
+		arg.RefreshToken,
+		arg.Scope,
+		arg.AccessTokenExpiresAt,
+		arg.UpdatedAt,
+		arg.ID,
+	)
+	return err
+}
+
+const updateUserOnLogin = `-- name: UpdateUserOnLogin :exec
+UPDATE "user" SET name = $1, email = $2, image = $3, "updatedAt" = $4
+WHERE id = $5
+`
+
+type UpdateUserOnLoginParams struct {
+	Name      string
+	Email     string
+	Image     sql.NullString
+	UpdatedAt time.Time
+	ID        string
+}
+
+func (q *Queries) UpdateUserOnLogin(ctx context.Context, arg UpdateUserOnLoginParams) error {
+	_, err := q.db.ExecContext(ctx, updateUserOnLogin,
+		arg.Name,
+		arg.Email,
+		arg.Image,
+		arg.UpdatedAt,
+		arg.ID,
+	)
+	return err
+}
+
 const updateUserPlaceholder = `-- name: UpdateUserPlaceholder :exec
 UPDATE "user" SET name = $1 WHERE id = $2
 `
@@ -114,6 +644,81 @@ type UpdateUserPlaceholderParams struct {
 // table shape. Keep the raw db.Exec in users.go for now.
 func (q *Queries) UpdateUserPlaceholder(ctx context.Context, arg UpdateUserPlaceholderParams) error {
 	_, err := q.db.ExecContext(ctx, updateUserPlaceholder, arg.Name, arg.ID)
+	return err
+}
+
+const updateUserProfile = `-- name: UpdateUserProfile :exec
+UPDATE "user" SET
+  "updatedAt" = $1,
+  name = COALESCE($2, name),
+  slug = COALESCE($3, slug),
+  image = CASE WHEN $4::boolean THEN $5 ELSE image END,
+  biography = CASE WHEN $6::boolean THEN $7 ELSE biography END,
+  "careerOverview" = CASE WHEN $8::boolean THEN $9 ELSE "careerOverview" END,
+  "vrchatUsername" = CASE WHEN $10::boolean THEN $11 ELSE "vrchatUsername" END
+WHERE id = $12
+`
+
+type UpdateUserProfileParams struct {
+	UpdatedAt    time.Time
+	Name         sql.NullString
+	Slug         sql.NullString
+	ImageSet     bool
+	ImageVal     sql.NullString
+	BiographySet bool
+	BiographyVal sql.NullString
+	CareerSet    bool
+	CareerVal    sql.NullString
+	VrchatSet    bool
+	VrchatVal    sql.NullString
+	ID           string
+}
+
+// Profile update: nil leaves the column unchanged, except image-like
+// fields where non-nil (even empty, mapping to NULL) overwrites.
+func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) error {
+	_, err := q.db.ExecContext(ctx, updateUserProfile,
+		arg.UpdatedAt,
+		arg.Name,
+		arg.Slug,
+		arg.ImageSet,
+		arg.ImageVal,
+		arg.BiographySet,
+		arg.BiographyVal,
+		arg.CareerSet,
+		arg.CareerVal,
+		arg.VrchatSet,
+		arg.VrchatVal,
+		arg.ID,
+	)
+	return err
+}
+
+const updateUserSiteRole = `-- name: UpdateUserSiteRole :exec
+UPDATE "user" SET "siteRole" = $1 WHERE id = $2
+`
+
+type UpdateUserSiteRoleParams struct {
+	SiteRole interface{}
+	ID       string
+}
+
+func (q *Queries) UpdateUserSiteRole(ctx context.Context, arg UpdateUserSiteRoleParams) error {
+	_, err := q.db.ExecContext(ctx, updateUserSiteRole, arg.SiteRole, arg.ID)
+	return err
+}
+
+const updateUserSlug = `-- name: UpdateUserSlug :exec
+UPDATE "user" SET slug = $1 WHERE id = $2
+`
+
+type UpdateUserSlugParams struct {
+	Slug sql.NullString
+	ID   string
+}
+
+func (q *Queries) UpdateUserSlug(ctx context.Context, arg UpdateUserSlugParams) error {
+	_, err := q.db.ExecContext(ctx, updateUserSlug, arg.Slug, arg.ID)
 	return err
 }
 

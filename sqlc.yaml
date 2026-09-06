@@ -4,6 +4,28 @@ sql:
     schema:
       - "shared/migrations/*.sql"
     queries:
+      - "auth/sqlc/queries"
+    gen:
+      go:
+        package: "sqlc"
+        out: "auth/sqlc"
+        sql_package: "database/sql"
+        emit_pointers_for_null_types: false
+  - engine: "postgresql"
+    schema:
+      - "shared/migrations/*.sql"
+    queries:
+      - "eventmanager/sqlc/queries"
+    gen:
+      go:
+        package: "sqlc"
+        out: "eventmanager/sqlc"
+        sql_package: "database/sql"
+        emit_pointers_for_null_types: false
+  - engine: "postgresql"
+    schema:
+      - "shared/migrations/*.sql"
+    queries:
       - "teammanager/sqlc/queries"
     gen:
       go:
