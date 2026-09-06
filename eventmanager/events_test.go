@@ -110,11 +110,19 @@ func (f *fixtures) createEventDirect(ownerID, name, status string, restriction *
 	if restriction != nil {
 		r = *restriction
 	}
+	st := status
+	if st == "UNOFFICIAL" || st == "OFFICIAL" {
+		st = "PENDING"
+	}
+	tag := "OFFICIAL"
+	if status == "UNOFFICIAL" {
+		tag = "COMMUNITY"
+	}
 	_, err := db.Exec(f.ctx,
-		`INSERT INTO "event" (id, name, "ownerType", "ownerUserId", status, "scoringType",
+		`INSERT INTO "event" (id, name, "ownerType", "ownerUserId", status, tag, "scoringType",
 		  "classRestriction", "granularParticipation", "createdAt", "updatedAt")
-		 VALUES ($1, $2, 'USER', $3, $4, 1, $5, $6, $7, $7)`,
-		id, name, ownerID, status, r, granular, now)
+		 VALUES ($1, $2, 'USER', $3, $4, $5, 1, $6, $7, $8, $8)`,
+		id, name, ownerID, st, tag, r, granular, now)
 	if err != nil {
 		f.t.Fatalf("insert event: %v", err)
 	}
@@ -128,9 +136,9 @@ func (f *fixtures) createEventDirectWithLimit(ownerID, name string, limit int) s
 	id := "event-" + newID()[:8]
 	now := time.Now().UTC()
 	_, err := db.Exec(f.ctx,
-		`INSERT INTO "event" (id, name, "ownerType", "ownerUserId", status, "scoringType",
+		`INSERT INTO "event" (id, name, "ownerType", "ownerUserId", status, tag, "scoringType",
 		  "participantLimit", "createdAt", "updatedAt")
-		 VALUES ($1, $2, 'USER', $3, 'UNOFFICIAL', 1, $4, $5, $5)`,
+		 VALUES ($1, $2, 'USER', $3, 'PENDING', 'OFFICIAL', 1, $4, $5, $5)`,
 		id, name, ownerID, limit, now)
 	if err != nil {
 		f.t.Fatalf("insert event: %v", err)
@@ -551,32 +559,47 @@ func Test_AddScheduleAndAdmins(t *testing.T) {
 
 func Test_ListAndDeleteEvents(t *testing.T) {
 	f := newFixtures(t)
-	userID := f.createUser("lister", "Lister User", nil, "USER")
-	token := f.createSession(userID)
+	adminID := f.createUser("admin-lister", "Admin Lister User", nil, "SITE_ADMIN")
+	adminToken := f.createSession(adminID)
 
 	a, err := CreateEventCore(f.ctx, &CreateEventRequest{
-		Authorization: token, Name: "List Event A " + newID()[:8],
-		OwnerType: "USER", ScoringType: ScoringPoints,
+		Authorization: adminToken, Name: "List Event A " + newID()[:8],
+		OwnerType: "USER", ScoringType: ScoringPoints, Tag: strptr("OFFICIAL"),
 	})
 	if err != nil {
 		t.Fatalf("create A: %v", err)
 	}
 	f.events = append(f.events, a.ID)
-	if a.ScoringTypeLabel != "points-based" || a.Status != "UNOFFICIAL" {
-		t.Errorf("detail = label %q status %q", a.ScoringTypeLabel, a.Status)
+	if a.ScoringTypeLabel != "points-based" || a.Status != "DRAFT" || a.Tag != "OFFICIAL" {
+		t.Errorf("detail = label %q status %q tag %q", a.ScoringTypeLabel, a.Status, a.Tag)
 	}
+
+	// Publish event A
+	a, err = SetEventStatusCore(f.ctx, &SetEventStatusRequest{
+		ID: a.ID, Authorization: adminToken, Status: strptr("PENDING"),
+	})
+	if err != nil {
+		t.Fatalf("publish A: %v", err)
+	}
+
 	b, err := CreateEventCore(f.ctx, &CreateEventRequest{
-		Authorization: token, Name: "List Event B " + newID()[:8],
-		OwnerType: "USER", ScoringType: ScoringLadder,
+		Authorization: adminToken, Name: "List Event B " + newID()[:8],
+		OwnerType: "USER", ScoringType: ScoringLadder, Tag: strptr("COMMUNITY"),
 	})
 	if err != nil {
 		t.Fatalf("create B: %v", err)
 	}
 	f.events = append(f.events, b.ID)
-	if b.ScoringTypeLabel != "ladder-elo" {
-		t.Errorf("ladder label = %q", b.ScoringTypeLabel)
+
+	// Publish event B
+	b, err = SetEventStatusCore(f.ctx, &SetEventStatusRequest{
+		ID: b.ID, Authorization: adminToken, Status: strptr("PENDING"),
+	})
+	if err != nil {
+		t.Fatalf("publish B: %v", err)
 	}
-	draftID := f.createEventDirect(userID, "Draft Hidden "+newID()[:8], "DRAFT", nil, false)
+
+	draftID := f.createEventDirect(adminID, "Draft Hidden "+newID()[:8], "DRAFT", nil, false)
 
 	listed, err := ListEventsCore(f.ctx, &ListEventsQuery{Limit: 50})
 	if err != nil {
@@ -610,12 +633,73 @@ func Test_ListAndDeleteEvents(t *testing.T) {
 		t.Errorf("public list must exclude DRAFT events")
 	}
 
-	del, err := DeleteEventCore(f.ctx, &DeleteEventRequest{ID: a.ID, Authorization: token})
+	// Soft delete event A
+	del, err := DeleteEventCore(f.ctx, &DeleteEventRequest{ID: a.ID, Authorization: adminToken})
 	if err != nil || !del.Deleted {
 		t.Fatalf("delete: %v %+v", del, err)
 	}
+
+	// Soft deleted event is now in PENDING_DELETION status
+	loadedSoft, err := LoadEvent(f.ctx, a.ID)
+	if err != nil || loadedSoft.Status != "PENDING_DELETION" {
+		t.Fatalf("load after soft delete: status = %v, err = %v", loadedSoft.Status, err)
+	}
+
+	// Excluded from standard public list
+	pubAfterSoft, err := ListPublicEventsCore(f.ctx, &ListPublicEventsQuery{Limit: 50})
+	if err != nil {
+		t.Fatalf("public list after soft delete: %v", err)
+	}
+	for _, e := range pubAfterSoft.Events {
+		if e.ID == a.ID {
+			t.Errorf("public list included soft deleted event")
+		}
+	}
+
+	// Restore event A
+	restored, err := RestoreEventCore(f.ctx, &RestoreEventRequest{ID: a.ID, Authorization: adminToken})
+	if err != nil || restored.Status != "PENDING" {
+		t.Fatalf("restore: status = %v, err = %v", restored.Status, err)
+	}
+
+	// Permanent delete event A
+	delPerm, err := DeleteEventCore(f.ctx, &DeleteEventRequest{ID: a.ID, Authorization: adminToken, Permanent: true})
+	if err != nil || !delPerm.Deleted {
+		t.Fatalf("permanent delete: %v %+v", delPerm, err)
+	}
 	if _, err := LoadEvent(f.ctx, a.ID); errs.Code(err) != errs.NotFound {
-		t.Fatalf("load after delete: code = %v, want NotFound", errs.Code(err))
+		t.Fatalf("load after perm delete: code = %v, want NotFound", errs.Code(err))
+	}
+}
+
+func Test_SoftDeleteAnd7DayAutoPurge(t *testing.T) {
+	f := newFixtures(t)
+	adminID := f.createUser("admin-purge", "Admin Purge User", nil, "SITE_ADMIN")
+
+	e1 := f.createEventDirect(adminID, "Expired Event", "PENDING", nil, false)
+	e2 := f.createEventDirect(adminID, "Recent Event", "PENDING", nil, false)
+
+	// Soft delete e1 (8 days ago)
+	eightDaysAgo := time.Now().UTC().AddDate(0, 0, -8)
+	_, _ = db.Exec(f.ctx, `UPDATE "event" SET status = 'PENDING_DELETION', "deletedAt" = $1 WHERE id = $2`, eightDaysAgo, e1)
+
+	// Soft delete e2 (2 days ago)
+	twoDaysAgo := time.Now().UTC().AddDate(0, 0, -2)
+	_, _ = db.Exec(f.ctx, `UPDATE "event" SET status = 'PENDING_DELETION', "deletedAt" = $1 WHERE id = $2`, twoDaysAgo, e2)
+
+	if err := PurgeExpiredDeletedEvents(f.ctx); err != nil {
+		t.Fatalf("purge error: %v", err)
+	}
+
+	// e1 should be permanently gone
+	if _, err := LoadEvent(f.ctx, e1); errs.Code(err) != errs.NotFound {
+		t.Errorf("expired soft deleted event e1 was not purged")
+	}
+
+	// e2 should still exist in PENDING_DELETION queue
+	loadedE2, err := LoadEvent(f.ctx, e2)
+	if err != nil || loadedE2.Status != "PENDING_DELETION" {
+		t.Errorf("recent soft deleted event e2 should remain in queue")
 	}
 }
 

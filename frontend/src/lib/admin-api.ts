@@ -1,7 +1,7 @@
 import { appClient } from './api'
 import { MOCK_MODE } from './mock-mode'
 import type { auth, eventmanager, teammanager } from './client'
-import type { ClassTier, EventStatus, EventOwnerType, SiteRole } from '../types'
+import type { ClassTier, EventStatus, EventTag, EventOwnerType, SiteRole } from '../types'
 
 const now = new Date().toISOString()
 
@@ -139,7 +139,8 @@ let mockEvents = [
     ownerType: 'ORGANIZATION',
     organizationId: 'org_mock_urs',
     ownerUserId: null,
-    status: 'UNOFFICIAL',
+    status: 'PENDING',
+    tag: 'OFFICIAL',
     scoringType: 1,
     scoringTypeLabel: 'points-based',
     scoringRulesMode: 'STANDARD',
@@ -170,6 +171,7 @@ let mockEvents = [
     organizationId: null,
     ownerUserId: 'mock-admin-1',
     status: 'DRAFT',
+    tag: 'COMMUNITY',
     scoringType: 2,
     scoringTypeLabel: 'ladder-elo',
     scoringRulesMode: null,
@@ -335,11 +337,17 @@ export async function listAdminEvents(
   classRestriction?: ClassTier,
   limit?: number,
   offset?: number,
+  status?: EventStatus,
+  tag?: EventTag,
+  includeDeleted?: boolean,
 ): Promise<{ events: eventmanager.EventListItem[]; total: number }> {
   if (!MOCK_MODE) {
     return appClient.eventmanager.ListEvents({
       OrganizationID: organizationId ?? '',
       ClassRestriction: classRestriction ?? '',
+      Status: status ?? '',
+      Tag: tag ?? '',
+      IncludeDeleted: includeDeleted ?? false,
       Limit: limit ?? 0,
       Offset: offset ?? 0,
     })
@@ -353,6 +361,8 @@ export async function listAdminEvents(
     organizationId: e.organizationId,
     ownerUserId: e.ownerUserId,
     status: e.status,
+    tag: e.tag ?? 'OFFICIAL',
+    deletedAt: e.deletedAt ?? null,
     scoringType: e.scoringType,
     scoringTypeLabel: e.scoringTypeLabel,
     classRestriction: e.classRestriction,
@@ -372,6 +382,14 @@ export async function listAdminEvents(
   }
   if (classRestriction) {
     events = events.filter((e) => e.classRestriction === classRestriction)
+  }
+  if (status) {
+    events = events.filter((e) => e.status === status)
+  } else if (!includeDeleted) {
+    events = events.filter((e) => e.status !== 'PENDING_DELETION')
+  }
+  if (tag) {
+    events = events.filter((e) => e.tag === tag)
   }
 
   const total = events.length
@@ -413,22 +431,101 @@ export async function getAdminEvent(eventId: string): Promise<eventmanager.Event
 
 export async function updateAdminEventStatus(
   eventId: string,
-  status: EventStatus,
+  params: { status?: EventStatus; tag?: EventTag },
   authorization: string,
 ): Promise<eventmanager.EventDetail> {
   if (!MOCK_MODE) {
     return appClient.eventmanager.SetEventStatus({
       id: eventId,
       Authorization: authorization,
-      status,
+      status: params.status,
+      tag: params.tag,
     })
   }
 
   mockEvents = mockEvents.map((event) =>
-    event.id === eventId ? { ...event, status, updatedAt: new Date().toISOString() } : event,
+    event.id === eventId
+      ? {
+          ...event,
+          ...(params.status ? { status: params.status } : {}),
+          ...(params.tag ? { tag: params.tag } : {}),
+          ...(params.status === 'PENDING_DELETION'
+            ? { deletedAt: new Date().toISOString() }
+            : params.status
+            ? { deletedAt: null }
+            : {}),
+          updatedAt: new Date().toISOString(),
+        }
+      : event,
   )
 
   const updated = mockEvents.find((event) => event.id === eventId)
+  if (!updated) {
+    throw new Error('Mock event not found')
+  }
+
+  return updated
+}
+
+export async function deleteAdminEvent(
+  eventId: string,
+  authorization: string,
+  permanent?: boolean,
+): Promise<{ deleted: boolean }> {
+  if (!MOCK_MODE) {
+    return appClient.eventmanager.DeleteEvent({
+      ID: eventId,
+      Authorization: authorization,
+      permanent,
+    })
+  }
+
+  const existing = mockEvents.find((e) => e.id === eventId)
+  if (!existing) {
+    throw new Error('Mock event not found')
+  }
+
+  if (permanent || existing.status === 'PENDING_DELETION') {
+    mockEvents = mockEvents.filter((e) => e.id !== eventId)
+  } else {
+    mockEvents = mockEvents.map((e) =>
+      e.id === eventId
+        ? {
+            ...e,
+            status: 'PENDING_DELETION' as EventStatus,
+            deletedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          }
+        : e,
+    )
+  }
+
+  return { deleted: true }
+}
+
+export async function restoreAdminEvent(
+  eventId: string,
+  authorization: string,
+): Promise<eventmanager.EventDetail> {
+  if (!MOCK_MODE) {
+    return appClient.eventmanager.RestoreEvent({
+      id: eventId,
+      Authorization: authorization,
+    })
+  }
+
+  mockEvents = mockEvents.map((e) =>
+    e.id === eventId
+      ? {
+          ...e,
+          status: 'PENDING' as EventStatus,
+          deletedAt: null,
+          updatedAt: new Date().toISOString(),
+        }
+      : e,
+  )
+
+  const updated = mockEvents.find((e) => e.id === eventId)
   if (!updated) {
     throw new Error('Mock event not found')
   }
@@ -572,6 +669,7 @@ export async function createAdminEvent(
     ownerType: EventOwnerType
     organizationId?: string | null
     ownerUserId?: string | null
+    tag?: EventTag | null
     scoringType: number
     classRestriction?: ClassTier | null
     granularParticipation?: boolean

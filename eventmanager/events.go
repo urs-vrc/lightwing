@@ -62,6 +62,8 @@ type EventListItem struct {
 	OrganizationID                  *string `json:"organizationId"`
 	OwnerUserID                     *string `json:"ownerUserId"`
 	Status                          string  `json:"status"`
+	Tag                             string  `json:"tag"`
+	DeletedAt                       *string `json:"deletedAt,omitempty"`
 	ScoringType                     int     `json:"scoringType"`
 	ScoringTypeLabel                string  `json:"scoringTypeLabel"`
 	ClassRestriction                *string `json:"classRestriction"`
@@ -144,6 +146,8 @@ type EventDetail struct {
 	OrganizationID                  *string            `json:"organizationId"`
 	OwnerUserID                     *string            `json:"ownerUserId"`
 	Status                          string             `json:"status"`
+	Tag                             string             `json:"tag"`
+	DeletedAt                       *string            `json:"deletedAt,omitempty"`
 	ScoringType                     int                `json:"scoringType"`
 	ScoringTypeLabel                string             `json:"scoringTypeLabel"`
 	ScoringRulesMode                *string            `json:"scoringRulesMode"`
@@ -218,6 +222,8 @@ type eventRow struct {
 	OrganizationID                  sql.NullString
 	OwnerUserID                     sql.NullString
 	Status                          string
+	Tag                             string
+	DeletedAt                       *time.Time
 	ScoringType                     int
 	ScoringRulesMode                sql.NullString
 	CustomScoringTables             []byte
@@ -231,13 +237,13 @@ type eventRow struct {
 	UpdatedAt                       time.Time
 }
 
-const eventColumns = `id, name, description, "ownerType", "organizationId", "ownerUserId", status, "scoringType", "scoringRulesMode", "customScoringTables", "classRestriction", "granularParticipation", "signupsLocked", "scheduledAt", "participantLimit", "maxConcurrentRaceParticipations", "createdAt", "updatedAt"`
+const eventColumns = `id, name, description, "ownerType", "organizationId", "ownerUserId", status, tag, "deletedAt", "scoringType", "scoringRulesMode", "customScoringTables", "classRestriction", "granularParticipation", "signupsLocked", "scheduledAt", "participantLimit", "maxConcurrentRaceParticipations", "createdAt", "updatedAt"`
 
 func scanEventRow(row *sqldb.Row) (*eventRow, error) {
 	var e eventRow
 	err := row.Scan(
 		&e.ID, &e.Name, &e.Description, &e.OwnerType, &e.OrganizationID, &e.OwnerUserID,
-		&e.Status, &e.ScoringType, &e.ScoringRulesMode, &e.CustomScoringTables,
+		&e.Status, &e.Tag, &e.DeletedAt, &e.ScoringType, &e.ScoringRulesMode, &e.CustomScoringTables,
 		&e.ClassRestriction, &e.GranularParticipation, &e.SignupsLocked, &e.ScheduledAt,
 		&e.ParticipantLimit, &e.MaxConcurrentRaceParticipations, &e.CreatedAt, &e.UpdatedAt,
 	)
@@ -467,7 +473,8 @@ func LoadEvent(ctx context.Context, id string) (*EventDetail, error) {
 	return &EventDetail{
 		ID: e.ID, Name: e.Name, Description: nullString(e.Description),
 		OwnerType: e.OwnerType, OrganizationID: nullString(e.OrganizationID),
-		OwnerUserID: nullString(e.OwnerUserID), Status: e.Status,
+		OwnerUserID: nullString(e.OwnerUserID), Status: e.Status, Tag: e.Tag,
+		DeletedAt: nullTime(e.DeletedAt),
 		ScoringType: e.ScoringType, ScoringTypeLabel: scoringLabel(e.ScoringType),
 		ScoringRulesMode: nullString(e.ScoringRulesMode), CustomScoringTables: customTables,
 		ClassRestriction: classTierPtr(e.ClassRestriction),
@@ -511,6 +518,7 @@ type CreateEventRequest struct {
 	OwnerType                         string          `json:"ownerType"`
 	OrganizationID                    *string         `json:"organizationId,omitempty"`
 	OwnerUserID                       *string         `json:"ownerUserId,omitempty"`
+	Tag                               *string         `json:"tag,omitempty"`
 	ScoringType                       int             `json:"scoringType"`
 	ScoringRulesMode                  *string         `json:"scoringRulesMode,omitempty"`
 	CustomScoringTables               json.RawMessage `json:"customScoringTables,omitempty"`
@@ -644,16 +652,31 @@ func CreateEventCore(ctx context.Context, p *CreateEventRequest) (*EventDetail, 
 		customTablesJSON = string(raw)
 	}
 
+	tag := "COMMUNITY"
+	if p.Tag != nil && *p.Tag != "" {
+		tag = *p.Tag
+	}
+	if tag == "UNOFFICIAL" {
+		tag = "COMMUNITY"
+	}
+	if tag == "OFFICIAL" {
+		if _, err := auth.RequireSiteAdmin(ctx, p.Authorization); err != nil {
+			return nil, err
+		}
+	} else if tag != "COMMUNITY" {
+		return nil, &errs.Error{Code: errs.InvalidArgument, Message: "tag must be OFFICIAL or COMMUNITY"}
+	}
+
 	now := time.Now().UTC()
 	id := newID()
 	_, err := db.Exec(ctx,
 		`INSERT INTO "event" (id, name, description, "ownerType", "organizationId", "ownerUserId",
-		  "scoringType", "scoringRulesMode", "customScoringTables", "classRestriction",
+		  status, tag, "scoringType", "scoringRulesMode", "customScoringTables", "classRestriction",
 		  "granularParticipation", "scheduledAt", "participantLimit", "maxConcurrentRaceParticipations",
 		  "createdAt", "updatedAt")
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)`,
+		 VALUES ($1,$2,$3,$4,$5,$6,'DRAFT',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16)`,
 		id, truncate(p.Name, 255), description, p.OwnerType, organizationID, ownerUserID,
-		p.ScoringType, scoringRulesMode, customTablesJSON, classRestriction,
+		tag, p.ScoringType, scoringRulesMode, customTablesJSON, classRestriction,
 		isGranular, scheduledAt, participantLimit, maxConcurrent,
 		now)
 	if err != nil {
@@ -669,12 +692,23 @@ func CreateEvent(ctx context.Context, p *CreateEventRequest) (*EventDetail, erro
 
 // --- List ---
 
+// PurgeExpiredDeletedEvents permanently deletes events in PENDING_DELETION state
+// that were deleted more than 7 days ago.
+func PurgeExpiredDeletedEvents(ctx context.Context) error {
+	threshold := time.Now().UTC().AddDate(0, 0, -7)
+	_, err := db.Exec(ctx, `DELETE FROM "event" WHERE status = 'PENDING_DELETION' AND "deletedAt" <= $1`, threshold)
+	return err
+}
+
 // ListEventsQuery carries optional filters plus pagination.
 //
 // Mirrors ts-legacy/eventmanager/events.ts ListEventsParams (GET /api/events).
 type ListEventsQuery struct {
 	OrganizationID   string `query:"organizationId"`
 	ClassRestriction string `query:"classRestriction"`
+	Status           string `query:"status"`
+	Tag              string `query:"tag"`
+	IncludeDeleted   bool   `query:"includeDeleted"`
 	Limit            int    `query:"limit"`
 	Offset           int    `query:"offset"`
 }
@@ -688,13 +722,12 @@ type ListEventsResponse struct {
 func scanListItem(scan func(...any) error) (EventListItem, error) {
 	var item EventListItem
 	var description, orgID, ownerUID, classRestriction sql.NullString
-	var schedTime *time.Time
+	var deletedTime, schedTime *time.Time
 	var participantLimit, maxConcurrent sql.NullInt64
 	var createdAt, updatedAt time.Time
 	var raceCount, memberCount int64
-	// scheduledAt scanned as *time.Time via a separate var to preserve NULL.
 	err := scan(&item.ID, &item.Name, &description, &item.OwnerType, &orgID, &ownerUID,
-		&item.Status, &item.ScoringType, &classRestriction, &item.GranularParticipation,
+		&item.Status, &item.Tag, &deletedTime, &item.ScoringType, &classRestriction, &item.GranularParticipation,
 		&item.SignupsLocked, &schedTime, &participantLimit, &maxConcurrent,
 		&createdAt, &updatedAt, &raceCount, &memberCount)
 	if err != nil {
@@ -703,6 +736,7 @@ func scanListItem(scan func(...any) error) (EventListItem, error) {
 	item.Description = nullString(description)
 	item.OrganizationID = nullString(orgID)
 	item.OwnerUserID = nullString(ownerUID)
+	item.DeletedAt = nullTime(deletedTime)
 	item.ScoringTypeLabel = scoringLabel(item.ScoringType)
 	item.ClassRestriction = classTierPtr(classRestriction)
 	item.ScheduledAt = nullTime(schedTime)
@@ -716,7 +750,7 @@ func scanListItem(scan func(...any) error) (EventListItem, error) {
 }
 
 const listItemSelect = `e.id, e.name, e.description, e."ownerType", e."organizationId", e."ownerUserId",
-	e.status, e."scoringType", e."classRestriction", e."granularParticipation",
+	e.status, e.tag, e."deletedAt", e."scoringType", e."classRestriction", e."granularParticipation",
 	e."signupsLocked", e."scheduledAt", e."participantLimit", e."maxConcurrentRaceParticipations",
 	e."createdAt", e."updatedAt",
 	(SELECT COUNT(*) FROM "race_event" r WHERE r."eventId" = e.id),
@@ -724,6 +758,8 @@ const listItemSelect = `e.id, e.name, e.description, e."ownerType", e."organizat
 
 // ListEventsCore lists events with optional filters.
 func ListEventsCore(ctx context.Context, q *ListEventsQuery) (*ListEventsResponse, error) {
+	_ = PurgeExpiredDeletedEvents(ctx)
+
 	where := ""
 	args := []any{}
 	if q.OrganizationID != "" {
@@ -733,6 +769,16 @@ func ListEventsCore(ctx context.Context, q *ListEventsQuery) (*ListEventsRespons
 	if q.ClassRestriction != "" {
 		args = append(args, q.ClassRestriction)
 		where += fmt.Sprintf(" AND e.\"classRestriction\" = $%d", len(args))
+	}
+	if q.Tag != "" {
+		args = append(args, q.Tag)
+		where += fmt.Sprintf(" AND e.tag = $%d", len(args))
+	}
+	if q.Status != "" {
+		args = append(args, q.Status)
+		where += fmt.Sprintf(" AND e.status = $%d", len(args))
+	} else if !q.IncludeDeleted {
+		where += " AND e.status != 'PENDING_DELETION'"
 	}
 
 	var total int64
@@ -783,25 +829,22 @@ type ListPublicEventsQuery struct {
 	Offset int `query:"offset"`
 }
 
-// ListPublicEventsCore lists non-draft events (UNOFFICIAL, OFFICIAL, CONCLUDED).
-//
-// Mirrors ts-legacy/eventmanager/events.ts listPublicEvents.
-// It lives at /api/events-public (rather than /api/events/public) because a
-// static sub-path would route-conflict with /api/events/:id.
+// ListPublicEventsCore lists non-draft, active events (PENDING, ONGOING, CONCLUDED).
 func ListPublicEventsCore(ctx context.Context, q *ListPublicEventsQuery) (*ListEventsResponse, error) {
+	_ = PurgeExpiredDeletedEvents(ctx)
 	limit := q.Limit
 	if limit == 0 {
 		limit = 10
 	}
 	var total int64
 	if err := db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM "event" e WHERE e.status IN ('UNOFFICIAL','OFFICIAL','CONCLUDED')`,
+		`SELECT COUNT(*) FROM "event" e WHERE e.status IN ('PENDING','ONGOING','CONCLUDED')`,
 	).Scan(&total); err != nil {
 		return nil, err
 	}
 	rows, err := db.Query(ctx,
 		`SELECT `+listItemSelect+` FROM "event" e
-		 WHERE e.status IN ('UNOFFICIAL','OFFICIAL','CONCLUDED')
+		 WHERE e.status IN ('PENDING','ONGOING','CONCLUDED')
 		 ORDER BY e."createdAt" DESC LIMIT $1 OFFSET $2`, limit, q.Offset)
 	if err != nil {
 		return nil, err
@@ -954,14 +997,11 @@ func RemoveEventAdmin(ctx context.Context, p *RemoveEventAdminRequest) (*AddEven
 // --- Delete ---
 
 // DeleteEventRequest carries the event id plus the auth header (DELETE
-// decodes the struct from query params). The id travels in the query string
-// (rather than a :id path param) because this Encore version only accepts
-// scalar params alongside path params.
-//
-// Mirrors ts-legacy/eventmanager/events.ts deleteEvent (DELETE /api/events/:id).
+// decodes the struct from query params).
 type DeleteEventRequest struct {
 	ID            string `query:"id"`
 	Authorization string `header:"Authorization"`
+	Permanent     bool   `query:"permanent"`
 }
 
 // DeleteEventResponse reports deletion.
@@ -969,22 +1009,30 @@ type DeleteEventResponse struct {
 	Deleted bool `json:"deleted"`
 }
 
-// DeleteEventCore deletes an event and its related records (via FK cascades).
+// DeleteEventCore soft-deletes an event (putting it into PENDING_DELETION) or permanently deletes it if specified/already pending.
 func DeleteEventCore(ctx context.Context, p *DeleteEventRequest) (*DeleteEventResponse, error) {
-	var exists bool
-	if err := db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM "event" WHERE id = $1)`, p.ID,
-	).Scan(&exists); err != nil {
-		return nil, err
-	}
-	if !exists {
+	var status string
+	err := db.QueryRow(ctx,
+		`SELECT status FROM "event" WHERE id = $1`, p.ID,
+	).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "event not found"}
+	}
+	if err != nil {
+		return nil, err
 	}
 	if _, err := auth.RequireEventPermission(ctx, p.Authorization, p.ID, auth.ActionDelete); err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(ctx, `DELETE FROM "event" WHERE id = $1`, p.ID); err != nil {
-		return nil, err
+	if p.Permanent || status == "PENDING_DELETION" {
+		if _, err := db.Exec(ctx, `DELETE FROM "event" WHERE id = $1`, p.ID); err != nil {
+			return nil, err
+		}
+	} else {
+		now := time.Now().UTC()
+		if _, err := db.Exec(ctx, `UPDATE "event" SET status = 'PENDING_DELETION', "deletedAt" = $1 WHERE id = $2`, now, p.ID); err != nil {
+			return nil, err
+		}
 	}
 	return &DeleteEventResponse{Deleted: true}, nil
 }
@@ -992,4 +1040,33 @@ func DeleteEventCore(ctx context.Context, p *DeleteEventRequest) (*DeleteEventRe
 //encore:api public method=DELETE path=/api/events
 func DeleteEvent(ctx context.Context, p *DeleteEventRequest) (*DeleteEventResponse, error) {
 	return DeleteEventCore(ctx, p)
+}
+
+// RestoreEventRequest carries the event id plus the auth header.
+type RestoreEventRequest struct {
+	ID            string `json:"id"`
+	Authorization string `header:"Authorization"`
+}
+
+// RestoreEventCore restores a soft-deleted event back to PENDING.
+func RestoreEventCore(ctx context.Context, p *RestoreEventRequest) (*EventDetail, error) {
+	var exists bool
+	if err := db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM "event" WHERE id = $1)`, p.ID).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, &errs.Error{Code: errs.NotFound, Message: "event not found"}
+	}
+	if _, err := auth.RequireEventPermission(ctx, p.Authorization, p.ID, auth.ActionUpdate); err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(ctx, `UPDATE "event" SET status = 'PENDING', "deletedAt" = NULL WHERE id = $1`, p.ID); err != nil {
+		return nil, err
+	}
+	return LoadEvent(ctx, p.ID)
+}
+
+//encore:api public method=POST path=/api/event-restore
+func RestoreEvent(ctx context.Context, p *RestoreEventRequest) (*EventDetail, error) {
+	return RestoreEventCore(ctx, p)
 }

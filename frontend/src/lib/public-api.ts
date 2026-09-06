@@ -159,7 +159,8 @@ function loadMockEvents(): eventmanager.EventDetail[] {
       ownerType: 'ORGANIZATION',
       organizationId: 'org_mock_urs',
       ownerUserId: null,
-      status: 'UNOFFICIAL',
+      status: 'PENDING',
+      tag: 'OFFICIAL',
       scoringType: 1,
       scoringTypeLabel: 'points-based',
       scoringRulesMode: 'STANDARD',
@@ -300,6 +301,8 @@ export async function listPublicEvents(
     organizationId: e.organizationId,
     ownerUserId: e.ownerUserId,
     status: e.status,
+    tag: e.tag ?? 'OFFICIAL',
+    deletedAt: e.deletedAt ?? null,
     scoringType: e.scoringType,
     scoringTypeLabel: e.scoringTypeLabel,
     classRestriction: e.classRestriction,
@@ -374,7 +377,7 @@ export async function joinEvent(
   if (eventIndex === -1) throw new Error('Event not found')
 
   const event = mockPublicEvents[eventIndex]
-  if (event.status !== 'UNOFFICIAL' && event.status !== 'OFFICIAL') {
+  if (event.status !== 'PENDING' && event.status !== 'ONGOING') {
     throw new Error('Event is not open for public signup')
   }
 

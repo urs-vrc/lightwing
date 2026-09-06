@@ -531,6 +531,7 @@ export namespace eventmanager {
         ownerType: string
         organizationId: string
         ownerUserId: string
+        tag?: string
         scoringType: number
         scoringRulesMode: string
         customScoringTables: JSONValue
@@ -599,6 +600,7 @@ export namespace eventmanager {
     export interface DeleteEventRequest {
         ID: string
         Authorization: string
+        permanent?: boolean
     }
 
     /**
@@ -697,6 +699,8 @@ export namespace eventmanager {
         organizationId: string
         ownerUserId: string
         status: string
+        tag: string
+        deletedAt?: string | null
         scoringType: number
         scoringTypeLabel: string
         scoringRulesMode: string
@@ -727,6 +731,8 @@ export namespace eventmanager {
         organizationId: string
         ownerUserId: string
         status: string
+        tag: string
+        deletedAt?: string | null
         scoringType: number
         scoringTypeLabel: string
         classRestriction: string
@@ -821,6 +827,9 @@ export namespace eventmanager {
     export interface ListEventsQuery {
         OrganizationID: string
         ClassRestriction: string
+        Status?: string
+        Tag?: string
+        IncludeDeleted?: boolean
         Limit: number
         Offset: number
     }
@@ -1110,7 +1119,13 @@ export namespace eventmanager {
     export interface SetEventStatusRequest {
         id: string
         Authorization: string
-        status: string
+        status?: string
+        tag?: string
+    }
+
+    export interface RestoreEventRequest {
+        id: string
+        Authorization: string
     }
 
     /**
@@ -1205,6 +1220,7 @@ export namespace eventmanager {
             this.CreateRaceEvent = this.CreateRaceEvent.bind(this)
             this.DeleteEvent = this.DeleteEvent.bind(this)
             this.DeleteRaceEvent = this.DeleteRaceEvent.bind(this)
+            this.RestoreEvent = this.RestoreEvent.bind(this)
             this.DeleteRaceResult = this.DeleteRaceResult.bind(this)
             this.GetEvent = this.GetEvent.bind(this)
             this.GetRaceEvent = this.GetRaceEvent.bind(this)
@@ -1378,6 +1394,7 @@ export namespace eventmanager {
                 scheduledAt:                     params.scheduledAt,
                 scoringRulesMode:                params.scoringRulesMode,
                 scoringType:                     params.scoringType,
+                tag:                             params.tag,
             }
 
             // Now make the actual call to the API
@@ -1420,11 +1437,23 @@ export namespace eventmanager {
 
             const query = makeRecord<string, string | string[]>({
                 id: params.ID,
+                permanent: params.permanent ? "true" : undefined,
             })
 
             // Now make the actual call to the API
             const resp = await this.baseClient.callTypedAPI("DELETE", `/api/events`, undefined, {headers, query})
             return await resp.json() as DeleteEventResponse
+        }
+
+        public async RestoreEvent(params: RestoreEventRequest): Promise<EventDetail> {
+            const headers = makeRecord<string, string>({
+                authorization: params.Authorization,
+            })
+            const body: Record<string, any> = {
+                id: params.id,
+            }
+            const resp = await this.baseClient.callTypedAPI("POST", `/api/event-restore`, JSON.stringify(body), {headers})
+            return await resp.json() as EventDetail
         }
 
         public async DeleteRaceEvent(params: DeleteRaceEventRequest): Promise<DeleteRaceEventResponse> {
@@ -1580,6 +1609,9 @@ export namespace eventmanager {
             // Convert our params into the objects we need for the request
             const query = makeRecord<string, string | string[]>({
                 classRestriction: params.ClassRestriction,
+                status:           params.Status,
+                tag:              params.Tag,
+                includeDeleted:   params.IncludeDeleted ? "true" : undefined,
                 limit:            String(params.Limit),
                 offset:           String(params.Offset),
                 organizationId:   params.OrganizationID,
@@ -1818,6 +1850,7 @@ export namespace eventmanager {
             const body: Record<string, any> = {
                 id:     params.id,
                 status: params.status,
+                tag:    params.tag,
             }
 
             // Now make the actual call to the API

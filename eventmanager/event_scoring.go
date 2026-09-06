@@ -155,28 +155,59 @@ func RecordLadderMatch(ctx context.Context, p *LadderMatchRequest) (*EventDetail
 }
 
 // SetEventStatusRequest mirrors SetStatusParams (PUT /api/events/:id/status).
-// Endorsing an event as OFFICIAL is reserved for site administrators.
+// Endorsing an event with OFFICIAL tag is reserved for site administrators.
 type SetEventStatusRequest struct {
-	ID            string `json:"id"`
-	Authorization string `header:"Authorization"`
-	Status        string `json:"status"`
+	ID            string  `json:"id"`
+	Authorization string  `header:"Authorization"`
+	Status        *string `json:"status,omitempty"`
+	Tag           *string `json:"tag,omitempty"`
 }
 
-// SetEventStatusCore sets an event's lifecycle status.
+// SetEventStatusCore sets an event's lifecycle status and/or hosting tag.
 func SetEventStatusCore(ctx context.Context, p *SetEventStatusRequest) (*EventDetail, error) {
 	if _, err := requireEventRow(ctx, p.ID); err != nil {
 		return nil, err
 	}
-	if p.Status == "OFFICIAL" {
-		if _, err := auth.RequireSiteAdmin(ctx, p.Authorization); err != nil {
+
+	if p.Tag != nil && *p.Tag != "" {
+		tag := *p.Tag
+		if tag == "UNOFFICIAL" {
+			tag = "COMMUNITY"
+		}
+		if tag == "OFFICIAL" {
+			if _, err := auth.RequireSiteAdmin(ctx, p.Authorization); err != nil {
+				return nil, err
+			}
+		} else if tag != "COMMUNITY" {
+			return nil, &errs.Error{Code: errs.InvalidArgument, Message: "tag must be OFFICIAL or COMMUNITY"}
+		} else if _, err := auth.RequireEventPermission(ctx, p.Authorization, p.ID, auth.ActionUpdate); err != nil {
 			return nil, err
 		}
-	} else if _, err := auth.RequireEventPermission(ctx, p.Authorization, p.ID, auth.ActionUpdate); err != nil {
-		return nil, err
+		if _, err := db.Exec(ctx, `UPDATE "event" SET tag=$1 WHERE id=$2`, tag, p.ID); err != nil {
+			return nil, err
+		}
 	}
-	if _, err := db.Exec(ctx, `UPDATE "event" SET status=$1 WHERE id=$2`, p.Status, p.ID); err != nil {
-		return nil, err
+
+	if p.Status != nil && *p.Status != "" {
+		st := *p.Status
+		if st != "DRAFT" && st != "PENDING" && st != "ONGOING" && st != "CONCLUDED" && st != "PENDING_DELETION" {
+			return nil, &errs.Error{Code: errs.InvalidArgument, Message: "invalid event status"}
+		}
+		if _, err := auth.RequireEventPermission(ctx, p.Authorization, p.ID, auth.ActionUpdate); err != nil {
+			return nil, err
+		}
+		if st == "PENDING_DELETION" {
+			now := time.Now().UTC()
+			if _, err := db.Exec(ctx, `UPDATE "event" SET status=$1, "deletedAt"=$2 WHERE id=$3`, st, now, p.ID); err != nil {
+				return nil, err
+			}
+		} else {
+			if _, err := db.Exec(ctx, `UPDATE "event" SET status=$1, "deletedAt"=NULL WHERE id=$2`, st, p.ID); err != nil {
+				return nil, err
+			}
+		}
 	}
+
 	return LoadEvent(ctx, p.ID)
 }
 

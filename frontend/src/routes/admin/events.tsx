@@ -4,7 +4,7 @@ import { useAuth } from '../../hooks/useAuth'
 import { requireSiteAdmin } from '../../lib/auth-guard'
 import { AdminLayout } from './-AdminLayout'
 import { listAdminEvents, createAdminEvent } from '../../lib/admin-api'
-import type { ClassTier, EventOwnerType } from '../../types'
+import type { ClassTier, EventOwnerType, EventStatus, EventTag } from '../../types'
 import { AlertBanner } from '../../components/AlertBanner'
 import { UserSearchCombobox } from '../../components/UserSearchCombobox'
 import { TeamSearchCombobox } from '../../components/TeamSearchCombobox'
@@ -34,11 +34,13 @@ function AdminEventsListPage() {
   const [pageSize, setPageSize] = useState(10)
   const [loadingEvents, setLoadingEvents] = useState(true)
   const [globalError, setGlobalError] = useState<string | null>(null)
+  const [viewPendingDeletion, setViewPendingDeletion] = useState(false)
 
   // Create Event Form state
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [formName, setFormName] = useState('')
   const [formDescription, setFormDescription] = useState('')
+  const [formTag, setFormTag] = useState<EventTag>('OFFICIAL')
   const [formOwnerType, setFormOwnerType] = useState<EventOwnerType>('USER')
   const [formOwnerUserId, setFormOwnerUserId] = useState('')
   const [formOrganizationId, setFormOrganizationId] = useState('')
@@ -61,7 +63,8 @@ function AdminEventsListPage() {
     setGlobalError(null)
     try {
       const offset = (page - 1) * pageSize
-      const response = await listAdminEvents(undefined, undefined, pageSize, offset)
+      const statusParam = viewPendingDeletion ? ('PENDING_DELETION' as EventStatus) : undefined
+      const response = await listAdminEvents(undefined, undefined, pageSize, offset, statusParam, undefined, viewPendingDeletion)
       setEvents(response.events)
       setTotalEvents(response.total)
     } catch (cause) {
@@ -73,13 +76,14 @@ function AdminEventsListPage() {
 
   useEffect(() => {
     void loadEvents()
-  }, [page, pageSize])
+  }, [page, pageSize, viewPendingDeletion])
 
   // Set default values when modal opens or active session changes
   useEffect(() => {
     if (showCreateModal) {
       setFormName('')
       setFormDescription('')
+      setFormTag('OFFICIAL')
       setFormOwnerType('USER')
       setFormOwnerUserId(activeUserId || 'mock-admin-1')
       setFormOrganizationId(activeOrgId || 'org_mock_urs')
@@ -156,6 +160,7 @@ function AdminEventsListPage() {
           ownerType: formOwnerType,
           organizationId: formOwnerType === 'ORGANIZATION' ? (formOrganizationId.trim() || null) : null,
           ownerUserId: formOwnerType === 'USER' ? (formOwnerUserId.trim() || null) : null,
+          tag: formTag,
           scoringType: Number(formScoringType),
           classRestriction: formClassRestriction ? (formClassRestriction as ClassTier) : null,
           granularParticipation: formGranularParticipation,
@@ -230,6 +235,24 @@ function AdminEventsListPage() {
                   </h2>
                 </div>
               </header>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  type="button"
+                  onClick={() => { setViewPendingDeletion(false); setPage(1); }}
+                  className={`slds-button ${!viewPendingDeletion ? 'slds-button_brand' : 'slds-button_neutral'}`}
+                  style={{ fontSize: '11px', padding: '2px 10px' }}
+                >
+                  Active Events
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setViewPendingDeletion(true); setPage(1); }}
+                  className={`slds-button ${viewPendingDeletion ? 'slds-button_destructive' : 'slds-button_neutral'}`}
+                  style={{ fontSize: '11px', padding: '2px 10px' }}
+                >
+                  Pending Deletion Queue
+                </button>
+              </div>
             </div>
 
             <div className="slds-card__body" style={{ padding: '0 1rem 1rem 1rem' }}>
@@ -257,24 +280,32 @@ function AdminEventsListPage() {
                         >
                           <div className="slds-grid slds-grid_align-spread" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                             <span className="slds-text-body_regular font-bold text-slate-900" style={{ fontWeight: 'bold', fontSize: '1rem' }}>{evt.name}</span>
-                            <span
-                              className={`slds-badge ${
-                                evt.status === 'OFFICIAL'
-                                  ? 'slds-theme_success'
-                                  : evt.status === 'CONCLUDED'
-                                  ? 'slds-theme_inverse'
-                                  : 'slds-theme_light'
-                              }`}
-                              style={{
-                                fontSize: '10px',
-                                padding: '2px 8px',
-                                borderRadius: '3px',
-                                color: evt.status === 'OFFICIAL' ? '#fff' : evt.status === 'CONCLUDED' ? '#fff' : '#000',
-                                backgroundColor: evt.status === 'OFFICIAL' ? '#2e7d32' : evt.status === 'CONCLUDED' ? '#180505' : '#e0e0e0',
-                              }}
-                            >
-                              {evt.status}
-                            </span>
+                            <div style={{ display: 'flex', gap: '6px' }}>
+                              <span
+                                className="slds-badge"
+                                style={{
+                                  fontSize: '10px',
+                                  padding: '2px 8px',
+                                  borderRadius: '3px',
+                                  color: evt.tag === 'OFFICIAL' ? '#fff' : '#1e293b',
+                                  backgroundColor: evt.tag === 'OFFICIAL' ? '#7c3aed' : '#e2e8f0',
+                                }}
+                              >
+                                {evt.tag || 'OFFICIAL'}
+                              </span>
+                              <span
+                                className="slds-badge"
+                                style={{
+                                  fontSize: '10px',
+                                  padding: '2px 8px',
+                                  borderRadius: '3px',
+                                  color: evt.status === 'ONGOING' ? '#fff' : evt.status === 'CONCLUDED' ? '#fff' : evt.status === 'PENDING_DELETION' ? '#fff' : '#1e293b',
+                                  backgroundColor: evt.status === 'ONGOING' ? '#16a34a' : evt.status === 'CONCLUDED' ? '#1e293b' : evt.status === 'PENDING_DELETION' ? '#dc2626' : evt.status === 'PENDING' ? '#0284c7' : '#e2e8f0',
+                                }}
+                              >
+                                {evt.status}
+                              </span>
+                            </div>
                           </div>
                           <div className="slds-text-body_small text-slate-500 slds-m-top_xx-small" style={{ fontSize: '12px', display: 'flex', justifyContent: 'space-between' }}>
                             <span>Type: {evt.scoringTypeLabel}</span>
@@ -369,6 +400,25 @@ function AdminEventsListPage() {
                           className="slds-textarea"
                           style={{ padding: '6px 12px', border: '1px solid #dddbda', borderRadius: '4px', width: '100%', minHeight: '80px' }}
                         />
+                      </div>
+                    </div>
+
+                    {/* Event Hosting Tag */}
+                    <div className="slds-form-element slds-m-bottom_medium">
+                      <label className="slds-form-element__label font-bold text-slate-700" style={{ fontWeight: 'bold' }} htmlFor="event-tag">
+                        Event Hosting Tag
+                      </label>
+                      <div className="slds-form-element__control">
+                        <select
+                          id="event-tag"
+                          value={formTag}
+                          onChange={(e) => setFormTag(e.target.value as EventTag)}
+                          className="slds-select"
+                          style={{ padding: '6px 12px', border: '1px solid #dddbda', borderRadius: '4px', width: '100%' }}
+                        >
+                          <option value="OFFICIAL">Official (Officially Hosted)</option>
+                          <option value="COMMUNITY">Community (Community Hosted)</option>
+                        </select>
                       </div>
                     </div>
 

@@ -4,7 +4,7 @@ import {
   setEventSignupsLocked,
 } from '../lib/admin-api'
 import type { eventmanager } from '../lib/client'
-import type { EventStatus } from '../types'
+import type { EventStatus, EventTag } from '../types'
 
 interface UseEventStatusProps {
   eventId: string;
@@ -24,9 +24,9 @@ export function useEventStatus({
   const [eventStatusSaving, setEventStatusSaving] = useState(false)
   const [signupsLockedSaving, setSignupsLockedSaving] = useState(false)
 
-  // Update parent event lifecycle status
+  // Update parent event lifecycle status and/or tag
   const handleUpdateEventStatus = useCallback(
-    async (status: EventStatus) => {
+    async (params: { status?: EventStatus; tag?: EventTag }) => {
       if (!authHeader) {
         setGlobalError('Authentication token is required.')
         return
@@ -35,9 +35,9 @@ export function useEventStatus({
       setGlobalError(null)
       setGlobalSuccess(null)
       try {
-        const updated = await updateAdminEventStatus(eventId, status, authHeader)
+        const updated = await updateAdminEventStatus(eventId, params, authHeader)
         setSelectedEvent(updated)
-        setGlobalSuccess(`Successfully updated event status to ${status}.`)
+        setGlobalSuccess(`Successfully updated event settings.`)
       } catch (cause) {
         setGlobalError(cause instanceof Error ? cause.message : 'Unable to update status')
       } finally {

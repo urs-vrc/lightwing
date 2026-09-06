@@ -168,21 +168,15 @@ func loadRaceDetail(ctx context.Context, r *raceEventRow) (*RaceEventDetail, err
 
 // requireEventRow loads the parent event row or returns NotFound.
 func requireEventRow(ctx context.Context, eventID string) (*eventRow, error) {
-	var e eventRow
-	err := db.QueryRow(ctx,
-		`SELECT `+eventColumns+` FROM "event" WHERE id = $1`, eventID,
-	).Scan(&e.ID, &e.Name, &e.Description, &e.OwnerType, &e.OrganizationID,
-		&e.OwnerUserID, &e.Status, &e.ScoringType, &e.ScoringRulesMode,
-		&e.CustomScoringTables, &e.ClassRestriction, &e.GranularParticipation,
-		&e.SignupsLocked, &e.ScheduledAt, &e.ParticipantLimit,
-		&e.MaxConcurrentRaceParticipations, &e.CreatedAt, &e.UpdatedAt)
+	e, err := scanEventRow(db.QueryRow(ctx,
+		`SELECT `+eventColumns+` FROM "event" WHERE id = $1`, eventID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, &errs.Error{Code: errs.NotFound, Message: "event not found"}
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &e, nil
+	return e, nil
 }
 
 // parseTimePtr parses an optional ISO timestamp into UTC, or nil when empty.
@@ -667,7 +661,7 @@ func AddRaceEventMemberCore(ctx context.Context, p *RaceMemberRequest) (*RaceEve
 	var e eventRow
 	err = tx.QueryRow(ctx, `SELECT `+eventColumns+` FROM "event" WHERE id = $1`, p.EventID,
 	).Scan(&e.ID, &e.Name, &e.Description, &e.OwnerType, &e.OrganizationID,
-		&e.OwnerUserID, &e.Status, &e.ScoringType, &e.ScoringRulesMode,
+		&e.OwnerUserID, &e.Status, &e.Tag, &e.DeletedAt, &e.ScoringType, &e.ScoringRulesMode,
 		&e.CustomScoringTables, &e.ClassRestriction, &e.GranularParticipation,
 		&e.SignupsLocked, &e.ScheduledAt, &e.ParticipantLimit,
 		&e.MaxConcurrentRaceParticipations, &e.CreatedAt, &e.UpdatedAt)
@@ -871,7 +865,7 @@ func JoinRaceEventCore(ctx context.Context, p *RaceJoinRequest) (*RaceEventDetai
 	var e eventRow
 	err = tx.QueryRow(ctx, `SELECT `+eventColumns+` FROM "event" WHERE id = $1`, p.EventID,
 	).Scan(&e.ID, &e.Name, &e.Description, &e.OwnerType, &e.OrganizationID,
-		&e.OwnerUserID, &e.Status, &e.ScoringType, &e.ScoringRulesMode,
+		&e.OwnerUserID, &e.Status, &e.Tag, &e.DeletedAt, &e.ScoringType, &e.ScoringRulesMode,
 		&e.CustomScoringTables, &e.ClassRestriction, &e.GranularParticipation,
 		&e.SignupsLocked, &e.ScheduledAt, &e.ParticipantLimit,
 		&e.MaxConcurrentRaceParticipations, &e.CreatedAt, &e.UpdatedAt)

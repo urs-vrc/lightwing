@@ -174,7 +174,7 @@ type JoinEventRequest struct {
 	Authorization string `header:"Authorization"`
 }
 
-// JoinEventCore lets an authenticated user join an UNOFFICIAL or OFFICIAL
+// JoinEventCore lets an authenticated user join a PENDING or ONGOING
 // event. No event permission required; class restriction, signup lock, and
 // capacity are enforced.
 func JoinEventCore(ctx context.Context, p *JoinEventRequest) (*EventDetail, error) {
@@ -201,8 +201,8 @@ func JoinEventCore(ctx context.Context, p *JoinEventRequest) (*EventDetail, erro
 	if err != nil {
 		return nil, err
 	}
-	if event.Status != "UNOFFICIAL" && event.Status != "OFFICIAL" {
-		return nil, &errs.Error{Code: errs.FailedPrecondition, Message: "event is not open for public signup (must be UNOFFICIAL or OFFICIAL)"}
+	if event.Status != "PENDING" && event.Status != "ONGOING" {
+		return nil, &errs.Error{Code: errs.FailedPrecondition, Message: "event is not open for public signup (must be PENDING or ONGOING)"}
 	}
 	if event.SignupsLocked {
 		return nil, &errs.Error{Code: errs.FailedPrecondition, Message: "signups are locked for this event"}
